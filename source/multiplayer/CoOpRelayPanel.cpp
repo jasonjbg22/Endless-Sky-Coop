@@ -719,6 +719,8 @@ void CoOpRelayPanel::SetRoomPort(const string &port)
 void CoOpRelayPanel::HostRoom()
 {
 	CoOpRelayController::Get().StartHost(roomPort, roomName, roomPassword);
+	if(player.IsLoaded() && CoOpRelayController::Get().IsHostRunning() && !CoOpRelayController::Get().IsConnected())
+		CoOpRelayController::Get().JoinLocal(player, roomPort, roomPassword);
 	UI::PlaySound(UI::UISound::NORMAL);
 }
 
