@@ -53,5 +53,5 @@ jobs:
         with:
           tag_name: ${{ inputs.version }}
           name: Endless Sky Co-op ${{ inputs.version }}
-          prerelease: true
+          prerelease: false
           files: dist/${{ env.ASSET_NAME }}
