@@ -34,13 +34,14 @@ async def wait_for_server(port: int, timeout: float) -> None:
             await asyncio.sleep(0.1)
 
 
-async def run_smoke(exe: Path, repo: Path, timeout: float, debug: bool) -> None:
+async def run_smoke(exe: Path, repo: Path, timeout: float, debug: bool, server_world: bool,
+    full_lifecycle: bool) -> None:
     if not exe.exists():
         raise SmokeFailure(f"Endless Sky executable not found: {exe}")
 
     port = free_port()
     password = "game-smoke-pass"
-    relay = await asyncio.create_subprocess_exec(
+    command = [
         str(exe),
         "--coop-relay-server",
         str(port),
@@ -48,6 +49,12 @@ async def run_smoke(exe: Path, repo: Path, timeout: float, debug: bool) -> None:
         "Passworded Game Smoke",
         "--coop-relay-password",
         password,
+    ]
+    if server_world:
+        command.append("--coop-server-world")
+
+    relay = await asyncio.create_subprocess_exec(
+        *command,
         cwd=repo,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -72,9 +79,11 @@ async def run_smoke(exe: Path, repo: Path, timeout: float, debug: bool) -> None:
             clear_copied_save_state(config_a)
             clear_copied_save_state(config_b)
 
+            test_a = "Co-op Relay Smoke A" if full_lifecycle else "Co-op Relay Password Smoke A"
+            test_b = "Co-op Relay Smoke B" if full_lifecycle else "Co-op Relay Password Smoke B"
             results = await asyncio.gather(
-                run_client(exe, repo, config_a, "Co-op Relay Password Smoke A", endpoint, timeout, password, debug),
-                run_client(exe, repo, config_b, "Co-op Relay Password Smoke B", endpoint, timeout, password, debug),
+                run_client(exe, repo, config_a, test_a, endpoint, timeout, password, debug),
+                run_client(exe, repo, config_b, test_b, endpoint, timeout, password, debug),
             )
 
         failures: list[str] = []
@@ -99,15 +108,32 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--debug", action="store_true",
         help="pass --debug through to the Endless Sky integration clients")
+    parser.add_argument("--server-world", action="store_true",
+        help="enable the experimental standalone server-world mode")
+    parser.add_argument("--full-lifecycle", action="store_true",
+        help="run the richer A/B Direct IP lifecycle smoke against the executable server-world relay")
     args = parser.parse_args()
 
+    if args.full_lifecycle and not args.server_world:
+        print("--full-lifecycle is currently scoped to --server-world; use coop_relay_game_smoke_test.py "
+            "for default relay lifecycle coverage", file=sys.stderr)
+        return 2
+
     try:
-        asyncio.run(run_smoke(args.exe.resolve(), repo, args.timeout, args.debug))
+        asyncio.run(run_smoke(
+            args.exe.resolve(), repo, args.timeout, args.debug, args.server_world, args.full_lifecycle))
     except SmokeFailure as error:
         print(error, file=sys.stderr)
         return 1
 
-    print("passworded executable co-op relay game smoke passed")
+    if args.full_lifecycle and args.server_world:
+        print("passworded executable co-op relay server-world full lifecycle game smoke passed")
+    elif args.full_lifecycle:
+        print("passworded executable co-op relay full lifecycle game smoke passed")
+    elif args.server_world:
+        print("passworded executable co-op relay server-world game smoke passed")
+    else:
+        print("passworded executable co-op relay game smoke passed")
     return 0
 
 

@@ -1023,6 +1023,58 @@ TEST_CASE( "Co-op shared NPC store applies updates and removals", "[CoOpRelay]" 
 
 
 
+TEST_CASE( "Co-op client diagnostics count stale and duplicate proxy prevention", "[CoOpRelay]" )
+{
+	CoOpRelay::ClientSession session;
+	session.StartJoin("Player A");
+	REQUIRE(session.AcceptWelcome("welcome\t3\tplayer-1"));
+
+	CoOpRelay::PlayerSnapshot snapshot = Snapshot(5);
+	snapshot.playerId = "player-2";
+	REQUIRE(session.ReceiveRelayLine(CoOpRelay::Serialize(snapshot)));
+	CHECK(session.GetDiagnostics().remotePlayerProxies == 1);
+
+	CHECK_FALSE(session.ReceiveRelayLine(CoOpRelay::Serialize(snapshot)));
+	CHECK(session.GetDiagnostics().duplicatePreventionCount == 1);
+
+	CoOpRelay::PlayerSnapshot stale = snapshot;
+	stale.sequence = 4;
+	CHECK_FALSE(session.ReceiveRelayLine(CoOpRelay::Serialize(stale)));
+	CHECK(session.GetDiagnostics().staleProxyCount == 1);
+}
+
+
+
+TEST_CASE( "Co-op server diagnostics count stale and duplicate shared NPC prevention", "[CoOpRelay]" )
+{
+	CoOpRelay::RelayServerCore server;
+	const std::string playerA = server.Join("Player A");
+	const std::string playerB = server.Join("Player B");
+
+	CoOpRelay::PlayerSnapshot aSol = Snapshot(1);
+	aSol.playerId = playerA;
+	REQUIRE(SnapshotDeliveries(server.Receive(aSol)) == 1);
+	CoOpRelay::PlayerSnapshot bSol = Snapshot(1);
+	bSol.playerId = playerB;
+	REQUIRE(SnapshotDeliveries(server.Receive(bSol)) == 1);
+
+	CoOpRelay::SharedNPCSnapshot npc = NPCSnapshot(5);
+	npc.ownerId = playerA;
+	REQUIRE(NPCDeliveries(server.Receive(npc)) == 1);
+	CHECK(server.GetDiagnostics().npcProxies == 1);
+
+	CHECK(server.Receive(npc).empty());
+	CHECK(server.GetDiagnostics().duplicatePreventionCount == 1);
+
+	CoOpRelay::SharedNPCSnapshot stale = npc;
+	stale.sequence = 4;
+	stale.hull = .2;
+	CHECK(server.Receive(stale).empty());
+	CHECK(server.GetDiagnostics().staleProxyCount == 1);
+}
+
+
+
 TEST_CASE( "Co-op server world owns authority and shared NPCs", "[CoOpRelay]" )
 {
 	CoOpRelay::RelayServerCore server;
@@ -1095,6 +1147,67 @@ TEST_CASE( "Co-op server world applies damage to server-owned NPCs", "[CoOpRelay
 
 
 
+TEST_CASE( "Co-op server world rewards shared NPC destruction", "[CoOpRelay]" )
+{
+	CoOpRelay::RelayServerCore server;
+	server.SetServerWorldEnabled(true);
+	const std::string playerA = server.Join("Player A");
+	const std::string playerB = server.Join("Player B");
+
+	CoOpRelay::PlayerSnapshot aSol = Snapshot(1);
+	aSol.playerId = playerA;
+	REQUIRE(SnapshotDeliveries(server.Receive(aSol)) == 1);
+	CoOpRelay::PlayerSnapshot bSol = Snapshot(1);
+	bSol.playerId = playerB;
+	REQUIRE(SnapshotDeliveries(server.Receive(bSol)) == 1);
+	REQUIRE(NPCDeliveries(server.StepServerWorld()) == 12);
+
+	std::vector<CoOpRelay::SharedNPCSnapshot> npcs = server.SharedNPCs().InSystem("Sol");
+	REQUIRE(!npcs.empty());
+	CoOpRelay::SharedNPCDamage damage = NPCDamage(1);
+	damage.npcId = npcs.front().npcId;
+	damage.ownerId = npcs.front().ownerId;
+	damage.system = npcs.front().system;
+	damage.reporterId = playerA;
+	damage.shieldDamage = 1.;
+	damage.hullDamage = 1.;
+	damage.destroyed = true;
+
+	std::vector<CoOpRelay::RelayDelivery> deliveries = server.Receive(damage);
+	CHECK(NPCDeliveries(deliveries) == 2);
+	CHECK(MissionEventDeliveries(deliveries) == 2);
+	CHECK(ResourceEventDeliveries(deliveries) == 2);
+	CHECK(server.SharedNPCs().Get(npcs.front().npcId) == nullptr);
+
+	auto destroyedEvent = std::find_if(deliveries.begin(), deliveries.end(),
+		[](const CoOpRelay::RelayDelivery &delivery) {
+			return delivery.missionEvent
+				&& delivery.missionEvent->type == CoOpRelay::MissionEventType::NPC_DESTROYED;
+		});
+	REQUIRE(destroyedEvent != deliveries.end());
+	CHECK(destroyedEvent->missionEvent->playerId == "coop-server");
+	CHECK(destroyedEvent->missionEvent->npcId == npcs.front().npcId);
+
+	auto rewardA = std::find_if(deliveries.begin(), deliveries.end(),
+		[&playerA](const CoOpRelay::RelayDelivery &delivery) {
+			return delivery.resourceEvent && delivery.resourceEvent->targetPlayerId == playerA
+				&& delivery.resourceEvent->type == CoOpRelay::ResourceActionType::CREDIT_REWARD
+				&& delivery.resourceEvent->status == CoOpRelay::ResourceActionStatus::APPLIED;
+		});
+	auto rewardB = std::find_if(deliveries.begin(), deliveries.end(),
+		[&playerB](const CoOpRelay::RelayDelivery &delivery) {
+			return delivery.resourceEvent && delivery.resourceEvent->targetPlayerId == playerB
+				&& delivery.resourceEvent->type == CoOpRelay::ResourceActionType::CREDIT_REWARD
+				&& delivery.resourceEvent->status == CoOpRelay::ResourceActionStatus::APPLIED;
+		});
+	REQUIRE(rewardA != deliveries.end());
+	REQUIRE(rewardB != deliveries.end());
+	CHECK(rewardA->resourceEvent->amount > 0.);
+	CHECK(rewardA->resourceEvent->amount == rewardB->resourceEvent->amount);
+}
+
+
+
 TEST_CASE( "Co-op server world does not damage local-authoritative player ships", "[CoOpRelay]" )
 {
 	CoOpRelay::RelayServerCore server;
@@ -1124,7 +1237,47 @@ TEST_CASE( "Co-op server world does not damage local-authoritative player ships"
 	CHECK(server.Presence().Get(playerA)->latest.shields == .8);
 	CHECK(server.Presence().Get(playerA)->latest.hull == .8);
 	REQUIRE(server.SharedNPCs().Get(npcs.front().npcId));
-	CHECK(server.SharedNPCs().Get(npcs.front().npcId)->targetId.empty());
+	CHECK(server.SharedNPCs().Get(npcs.front().npcId)->targetId == playerA);
+}
+
+
+
+TEST_CASE( "Co-op server world emits NPC weapon visuals without player damage", "[CoOpRelay]" )
+{
+	CoOpRelay::RelayServerCore server;
+	server.SetServerWorldEnabled(true);
+	const std::string playerA = server.Join("Player A");
+	const std::string playerB = server.Join("Player B");
+
+	CoOpRelay::PlayerSnapshot aSol = Snapshot(1);
+	aSol.playerId = playerA;
+	aSol.system = "Co-op Test Void";
+	aSol.position = Point(100., 0.);
+	REQUIRE(SnapshotDeliveries(server.Receive(aSol)) == 1);
+	CoOpRelay::PlayerSnapshot bSol = Snapshot(1);
+	bSol.playerId = playerB;
+	bSol.system = "Co-op Test Void";
+	bSol.position = Point(300., 0.);
+	REQUIRE(SnapshotDeliveries(server.Receive(bSol)) == 1);
+	REQUIRE(NPCDeliveries(server.StepServerWorld()) == 12);
+
+	std::vector<CoOpRelay::SharedNPCSnapshot> npcs = server.SharedNPCs().InSystem("Co-op Test Void");
+	REQUIRE(!npcs.empty());
+	aSol.sequence = 2;
+	aSol.position = npcs.front().position + Point(20., 0.);
+	REQUIRE_FALSE(server.Receive(aSol).empty());
+
+	std::vector<CoOpRelay::RelayDelivery> deliveries = server.StepServerWorld(60);
+	CHECK(CombatHitDeliveries(deliveries) == 0);
+	CHECK(WeaponFireDeliveries(deliveries) > 0);
+	const auto fireIt = std::find_if(deliveries.begin(), deliveries.end(),
+		[](const CoOpRelay::RelayDelivery &delivery) {
+			return delivery.weaponFire.has_value();
+		});
+	REQUIRE(fireIt != deliveries.end());
+	CHECK(fireIt->weaponFire->playerId == "coop-server");
+	CHECK(fireIt->weaponFire->targetPlayerId == playerA);
+	CHECK_FALSE(fireIt->weaponFire->weapon.empty());
 }
 
 
@@ -1236,6 +1389,46 @@ TEST_CASE( "Co-op server world handles boarding server-owned NPCs", "[CoOpRelay]
 		return event.targetPlayerId == playerB && event.type == CoOpRelay::ResourceActionType::CREDIT_REWARD
 			&& event.status == CoOpRelay::ResourceActionStatus::APPLIED && event.amount > 0.;
 	}));
+}
+
+
+
+TEST_CASE( "Co-op server world resyncs authoritative NPCs after reconnect", "[CoOpRelay]" )
+{
+	CoOpRelay::RelayServerCore server;
+	server.SetServerWorldEnabled(true);
+	const std::string playerA = server.Join("Player A");
+	const std::string playerB = server.Join("Player B");
+
+	CoOpRelay::PlayerSnapshot aSol = Snapshot(1);
+	aSol.playerId = playerA;
+	REQUIRE(SnapshotDeliveries(server.Receive(aSol)) == 1);
+	CoOpRelay::PlayerSnapshot bSol = Snapshot(1);
+	bSol.playerId = playerB;
+	REQUIRE(SnapshotDeliveries(server.Receive(bSol)) == 1);
+	REQUIRE(NPCDeliveries(server.StepServerWorld()) == 12);
+	REQUIRE(server.SharedNPCs().InSystem("Sol").size() == 6);
+
+	std::vector<CoOpRelay::RelayDelivery> leaveDeliveries = server.Leave(playerA);
+	CHECK(server.Presence().Get(playerA) == nullptr);
+	CHECK(SnapshotDeliveries(leaveDeliveries) == 0);
+	CHECK(server.SharedNPCs().InSystem("Sol").size() == 6);
+	CHECK(server.LatestSnapshotsFor(playerB).empty());
+
+	const std::string playerC = server.Join("Player A Reconnected");
+	std::vector<CoOpRelay::PlayerSnapshot> cachedSnapshots = server.LatestSnapshotsFor(playerC);
+	std::vector<CoOpRelay::SharedNPCSnapshot> cachedNPCs = server.LatestNPCsFor(playerC);
+	REQUIRE(cachedSnapshots.size() == 1);
+	CHECK(cachedSnapshots.front().playerId == playerB);
+	REQUIRE(cachedNPCs.size() == 6);
+	CHECK(std::all_of(cachedNPCs.begin(), cachedNPCs.end(), [](const CoOpRelay::SharedNPCSnapshot &snapshot) {
+		return snapshot.ownerId == "coop-server" && !snapshot.removed;
+	}));
+
+	CoOpRelay::PlayerSnapshot cSol = Snapshot(1);
+	cSol.playerId = playerC;
+	std::vector<CoOpRelay::RelayDelivery> cDeliveries = server.Receive(cSol);
+	CHECK(NPCDeliveries(cDeliveries) == 6);
 }
 
 

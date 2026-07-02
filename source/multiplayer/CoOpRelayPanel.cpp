@@ -175,6 +175,20 @@ namespace {
 
 
 
+	string RateText(double rate)
+	{
+		return to_string(static_cast<int>(rate + .5));
+	}
+
+
+
+	string LatencyText(int latencyMs)
+	{
+		return latencyMs >= 0 ? to_string(latencyMs) + " ms" : "n/a";
+	}
+
+
+
 	string RemoteName(const string &playerId, const CoOpRelay::PresenceStore &remotes)
 	{
 		const CoOpRelay::RemotePresence *presence = remotes.Get(playerId);
@@ -468,8 +482,30 @@ void CoOpRelayPanel::Draw()
 
 	const vector<string> &warnings = CoOpRelayController::Get().DesyncWarnings();
 	const vector<CoOpRelay::PlayerEvent> &events = CoOpRelayController::Get().RecentEvents();
-	font.Draw("Events", body.TopLeft() + Point(24., 556.), bright);
-	if(events.empty() && warnings.empty())
+	font.Draw(diagnosticsVisible ? "Diagnostics" : "Events", body.TopLeft() + Point(24., 556.), bright);
+	if(diagnosticsVisible)
+	{
+		const CoOpRelay::Diagnostics diagnostics = CoOpRelayController::Get().DiagnosticsFor(player);
+		string authorityOwner = diagnostics.authorityOwner.empty() ? "pending" : diagnostics.authorityOwner;
+		if(authorityOwner == CoOpRelayController::Get().PlayerId())
+			authorityOwner = "you";
+		font.Draw(FitText(font, "Players: " + to_string(diagnostics.connectedPlayers)
+			+ "    Player ID: " + (diagnostics.playerId.empty() ? "n/a" : diagnostics.playerId)
+			+ "    Authority: " + authorityOwner
+			+ "    Server world: " + (diagnostics.serverWorldEnabled ? "on" : "off"), 700.),
+			body.TopLeft() + Point(24., 582.), medium);
+		font.Draw(FitText(font, "Remote proxies: " + to_string(diagnostics.remotePlayerProxies)
+			+ "    NPC proxies: " + to_string(diagnostics.npcProxies)
+			+ "    Stale: " + to_string(diagnostics.staleProxyCount)
+			+ "    Duplicates blocked: " + to_string(diagnostics.duplicatePreventionCount), 700.),
+			body.TopLeft() + Point(24., 602.), diagnostics.staleProxyCount ? bright : medium);
+		font.Draw(FitText(font, "Snapshot age: " + to_string(diagnostics.lastSnapshotAgeSteps) + " steps"
+			+ "    Server tick: " + RateText(diagnostics.serverTickRate) + "/s"
+			+ "    Client snapshots: " + RateText(diagnostics.clientSnapshotRate) + "/s"
+			+ "    Ping: " + LatencyText(diagnostics.latencyMs), 700.),
+			body.TopLeft() + Point(24., 622.), medium);
+	}
+	else if(events.empty() && warnings.empty())
 		font.Draw("No remote events received.", body.TopLeft() + Point(24., 582.), inactive);
 	else
 	{
@@ -496,6 +532,11 @@ bool CoOpRelayPanel::KeyDown(SDL_Keycode key, Uint16, const Command &, bool)
 	if(key == SDLK_ESCAPE || key == 'b')
 	{
 		GetUI().Pop(this);
+		return true;
+	}
+	if(key == 'g')
+	{
+		diagnosticsVisible = !diagnosticsVisible;
 		return true;
 	}
 	if(key == 'h')

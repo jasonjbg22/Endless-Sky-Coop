@@ -19,12 +19,14 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "../GameData.h"
 #include "../Government.h"
 #include "../Hasher.h"
+#include "../Logger.h"
 #include "../Outfit.h"
 #include "../Planet.h"
 #include "../PlayerInfo.h"
 #include "../Random.h"
 #include "../Ship.h"
 #include "../System.h"
+#include "../Weapon.h"
 
 #include <algorithm>
 #include <charconv>
@@ -64,7 +66,35 @@ namespace {
 	constexpr double SERVER_WORLD_MAX_NPC_SPEED = 5.5;
 	constexpr double SERVER_WORLD_NPC_ACCELERATION = .18;
 	constexpr double SERVER_WORLD_WAYPOINT_REACHED = 180.;
+	constexpr double SERVER_WORLD_PLAYER_ENGAGE_RADIUS = 2400.;
 	constexpr double SERVER_WORLD_PLAYER_AVOID_RADIUS = 450.;
+	constexpr uint64_t SERVER_WORLD_WEAPON_FIRE_INTERVAL = 45;
+
+
+
+	bool CoopDiagnosticsLoggingEnabled()
+	{
+#ifdef _MSC_VER
+		char *value = nullptr;
+		size_t size = 0;
+		if(_dupenv_s(&value, &size, "ES_COOP_DIAGNOSTICS") || !value)
+			return false;
+		const bool enabled = string_view(value) == "1";
+		free(value);
+		return enabled;
+#else
+		const char *value = std::getenv("ES_COOP_DIAGNOSTICS");
+		return value && string_view(value) == "1";
+#endif
+	}
+
+
+
+	void LogCoopDiagnostics(const string &message)
+	{
+		if(CoopDiagnosticsLoggingEnabled())
+			Logger::Log(message, Logger::Level::INFO);
+	}
 
 
 
@@ -337,10 +367,68 @@ namespace {
 
 
 
+	bool ServerNPCIsHostile(const CoOpRelay::SharedNPCSnapshot &snapshot)
+	{
+		if(const Government *government = GameData::Governments().Find(snapshot.government))
+			return government->IsEnemy();
+		return snapshot.government == "Pirate";
+	}
+
+
+
 	double ServerNPCDisabledHull(const CoOpRelay::SharedNPCSnapshot &snapshot)
 	{
 		const Ship *model = ServerNPCModel(snapshot);
 		return model ? clamp(model->DisabledHull(), .01, .99) : .2;
+	}
+
+
+
+	const Outfit *ServerNPCWeaponOutfit(const CoOpRelay::SharedNPCSnapshot &snapshot)
+	{
+		if(const Ship *model = ServerNPCModel(snapshot))
+			for(const Hardpoint &hardpoint : model->Weapons())
+				if(const Outfit *outfit = hardpoint.GetOutfit())
+					if(outfit->GetWeapon())
+						return outfit;
+		const Outfit *fallback = GameData::Outfits().Find("Laser Turret");
+		if(fallback && fallback->GetWeapon())
+			return fallback;
+		fallback = GameData::Outfits().Find("Blaster Turret");
+		return (fallback && fallback->GetWeapon()) ? fallback : nullptr;
+	}
+
+
+
+	optional<CoOpRelay::SharedWeaponFire> ServerNPCWeaponFire(
+		const CoOpRelay::SharedNPCSnapshot &npc, const CoOpRelay::PlayerSnapshot &target, uint64_t sequence)
+	{
+		const Outfit *outfit = ServerNPCWeaponOutfit(npc);
+		const Weapon *weapon = outfit ? outfit->GetWeapon().get() : nullptr;
+		const string weaponName = outfit ? outfit->TrueName() : "Laser Turret";
+		const double weaponVelocity = weapon ? weapon->Velocity() : 24.;
+		const int weaponLifetime = weapon ? weapon->Lifetime() : 60;
+		const Point aim = target.position + target.velocity * 12.;
+		Point direction = aim - npc.position;
+		if(direction.LengthSquared() <= .0001)
+			direction = npc.facing.Unit();
+		const Angle facing(direction);
+		const double range = clamp(weaponVelocity * max(1, weaponLifetime), 240., 1800.);
+
+		CoOpRelay::SharedWeaponFire fire;
+		fire.sequence = sequence;
+		fire.playerId = SERVER_WORLD_OWNER_ID;
+		fire.system = npc.system;
+		fire.from = npc.position;
+		fire.to = npc.position + facing.Unit() * range;
+		fire.velocity = npc.velocity + facing.Unit() * max(weaponVelocity, 12.);
+		fire.facing = facing.Degrees();
+		fire.shipPosition = npc.position;
+		fire.shipVelocity = npc.velocity;
+		fire.hasShipVelocity = true;
+		fire.targetPlayerId = target.playerId;
+		fire.weapon = weaponName;
+		return fire.IsValid() ? optional<CoOpRelay::SharedWeaponFire>(fire) : nullopt;
 	}
 
 
@@ -865,6 +953,7 @@ bool CoOpRelay::SharedNPCStore::Apply(const SharedNPCSnapshot &snapshot)
 		if(snapshot.removed)
 			return false;
 		npcs.push_back(snapshot);
+		LogCoopDiagnostics("Co-op: created shared NPC proxy " + snapshot.npcId + " in " + snapshot.system + ".");
 		return true;
 	}
 
@@ -872,11 +961,13 @@ bool CoOpRelay::SharedNPCStore::Apply(const SharedNPCSnapshot &snapshot)
 		return false;
 	if(snapshot.removed)
 	{
+		LogCoopDiagnostics("Co-op: removed shared NPC proxy " + snapshot.npcId + " from " + snapshot.system + ".");
 		npcs.erase(it);
 		return true;
 	}
 
 	*it = snapshot;
+	LogCoopDiagnostics("Co-op: updated shared NPC proxy " + snapshot.npcId + " in " + snapshot.system + ".");
 	return true;
 }
 
@@ -1746,7 +1837,13 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::Receive(const Playe
 	const RemotePresence *previousPresence = presence.Get(snapshot.playerId);
 	const bool enteredSystem = !previousPresence || previousPresence->latest.system != snapshot.system;
 	if(!presence.Apply(snapshot))
+	{
+		if(previousPresence && snapshot.sequence == previousPresence->latest.sequence)
+			++duplicatePreventionCount;
+		else
+			++staleProxyCount;
 		return {};
+	}
 
 	vector<RelayDelivery> deliveries = SnapshotDeliveries(snapshot);
 	const vector<SystemAuthority> authorityChanges = serverWorldEnabled
@@ -1782,8 +1879,13 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::Receive(const Playe
 
 vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::Receive(const PeerEndpoint &endpoint)
 {
-	if(!HasPeer(endpoint.playerId) || !peerEndpoints.Apply(endpoint))
+	if(!HasPeer(endpoint.playerId))
 		return {};
+	if(!peerEndpoints.Apply(endpoint))
+	{
+		++staleProxyCount;
+		return {};
+	}
 	return PeerEndpointDeliveries(endpoint);
 }
 
@@ -1795,7 +1897,18 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::Receive(const Share
 	if(!snapshot.IsValid() || !HasPeer(snapshot.ownerId) || !authority || authority->ownerId != snapshot.ownerId)
 		return {};
 	if(!sharedNPCs.Apply(snapshot))
+	{
+		if(const SharedNPCSnapshot *stored = sharedNPCs.Get(snapshot.npcId))
+		{
+			if(SameNPCSnapshot(snapshot, *stored))
+				++duplicatePreventionCount;
+			else
+				++staleProxyCount;
+		}
+		else
+			++staleProxyCount;
 		return {};
+	}
 	return NPCDeliveries(snapshot);
 }
 
@@ -2220,10 +2333,20 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::StepServerWorld(uns
 		const Point toTarget = npc.destination - npc.snapshot.position;
 		const double maxVelocity = ServerNPCMaxVelocity(npc.snapshot);
 		Point desiredVelocity = toTarget.Unit() * maxVelocity;
+		const bool hostile = ServerNPCIsHostile(npc.snapshot);
+		if(hostile && nearestPlayer && bestDistance < SERVER_WORLD_PLAYER_ENGAGE_RADIUS)
+		{
+			npc.snapshot.targetId = nearestPlayer->latest.playerId;
+			const Point intercept = nearestPlayer->latest.position + nearestPlayer->latest.velocity * 12.;
+			const Point pursuit = intercept - npc.snapshot.position;
+			if(pursuit.LengthSquared() > .0001)
+				desiredVelocity = pursuit.Unit() * maxVelocity;
+		}
 		if(nearestPlayer && bestDistance < SERVER_WORLD_PLAYER_AVOID_RADIUS)
 		{
 			const Point away = (npc.snapshot.position - nearestPlayer->latest.position).Unit();
-			const Point blended = desiredVelocity + away * maxVelocity * 1.4;
+			const double avoidWeight = hostile ? .45 : 1.4;
+			const Point blended = desiredVelocity + away * maxVelocity * avoidWeight;
 			if(blended.LengthSquared() > .0001)
 				desiredVelocity = blended.Unit() * maxVelocity;
 		}
@@ -2235,6 +2358,17 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::StepServerWorld(uns
 			npc.snapshot.facing = Angle(npc.snapshot.velocity);
 		npc.snapshot.energy = min(1., npc.snapshot.energy + .01);
 		npc.snapshot.heat = max(0., npc.snapshot.heat - .005);
+		if(!npc.snapshot.targetId.empty() && nearestPlayer
+				&& serverWorldStep - npc.lastWeaponFireStep >= SERVER_WORLD_WEAPON_FIRE_INTERVAL)
+		{
+			if(optional<SharedWeaponFire> fire = ServerNPCWeaponFire(
+					npc.snapshot, nearestPlayer->latest, nextServerWeaponFireSequence++))
+			{
+				vector<RelayDelivery> fireDeliveries = WeaponFireDeliveries(*fire);
+				deliveries.insert(deliveries.end(), fireDeliveries.begin(), fireDeliveries.end());
+				npc.lastWeaponFireStep = serverWorldStep;
+			}
+		}
 
 		if(serverWorldStep - npc.lastPublishedStep < SERVER_WORLD_PUBLISH_INTERVAL)
 			continue;
@@ -2256,6 +2390,8 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::ReceiveServerNPCDam
 	if(!stored || stored->ownerId != SERVER_WORLD_OWNER_ID)
 		return {};
 
+	const string shipModel = stored->shipModel.empty() ? "ship" : stored->shipModel;
+	const Ship *model = ServerNPCModel(*stored);
 	SharedNPCSnapshot updated = *stored;
 	updated.sequence = nextServerNPCSequence++;
 	updated.shields = max(0., updated.shields - clamp(damage.shieldDamage, 0., 1.));
@@ -2283,7 +2419,63 @@ vector<CoOpRelay::RelayDelivery> CoOpRelay::RelayServerCore::ReceiveServerNPCDam
 				return npc.snapshot.npcId == updated.npcId;
 			}), serverNPCs.end());
 
-	return NPCDeliveries(updated, true);
+	vector<RelayDelivery> deliveries = NPCDeliveries(updated, true);
+	if(updated.destroyed)
+	{
+		SharedMissionEvent mission;
+		mission.sequence = nextServerMissionEventSequence++;
+		mission.missionId = "shared-npc";
+		mission.instanceId = updated.npcId;
+		mission.playerId = SERVER_WORLD_OWNER_ID;
+		mission.type = MissionEventType::NPC_DESTROYED;
+		mission.system = updated.system;
+		mission.npcId = updated.npcId;
+		mission.detail = "Shared " + shipModel + " destroyed.";
+		if(missionEvents.Apply(mission))
+		{
+			vector<RelayDelivery> missionDeliveries = MissionEventDeliveries(mission);
+			deliveries.insert(deliveries.end(), missionDeliveries.begin(), missionDeliveries.end());
+		}
+
+		vector<string> participants;
+		if(!damage.reporterId.empty())
+			participants.push_back(damage.reporterId);
+		for(const RemotePresence &remote : presence.InSystem(updated.system))
+		{
+			const string &playerId = remote.latest.playerId;
+			if(!playerId.empty() && find(participants.begin(), participants.end(), playerId) == participants.end())
+				participants.push_back(playerId);
+		}
+		if(!participants.empty())
+		{
+			const int64_t reward = model ? clamp<int64_t>(model->Cost() / 200, 500, 25000) : 2500;
+			const int64_t perPlayerCredits = max<int64_t>(1, reward / static_cast<int64_t>(participants.size()));
+			for(const string &participant : participants)
+			{
+				SharedResourceEvent event;
+				event.sequence = nextServerResourceEventSequence++;
+				event.actionId = "server-destroy-reward:" + updated.npcId + ":" + participant;
+				event.playerId = SERVER_WORLD_OWNER_ID;
+				event.targetPlayerId = participant;
+				event.type = ResourceActionType::CREDIT_REWARD;
+				event.status = ResourceActionStatus::APPLIED;
+				event.resource = "credits";
+				event.amount = static_cast<double>(perPlayerCredits);
+				event.detail = "Co-op reward: " + to_string(perPlayerCredits)
+					+ " credits for destroying shared " + shipModel + ".";
+				if(!resourceEvents.Apply(event))
+					continue;
+
+				resourceReplay.push_back({nextResourceReplayIndex++, event});
+				if(resourceReplay.size() > MAX_SESSION_EVENTS)
+					resourceReplay.erase(resourceReplay.begin());
+
+				vector<RelayDelivery> resourceDeliveries = ResourceEventDeliveries(event);
+				deliveries.insert(deliveries.end(), resourceDeliveries.begin(), resourceDeliveries.end());
+			}
+		}
+	}
+	return deliveries;
 }
 
 
@@ -2432,6 +2624,20 @@ size_t CoOpRelay::RelayServerCore::PlayerCount() const noexcept
 const CoOpRelay::PresenceStore &CoOpRelay::RelayServerCore::Presence() const noexcept
 {
 	return presence;
+}
+
+
+
+CoOpRelay::Diagnostics CoOpRelay::RelayServerCore::GetDiagnostics() const
+{
+	Diagnostics diagnostics;
+	diagnostics.connectedPlayers = peers.size();
+	diagnostics.serverWorldEnabled = serverWorldEnabled;
+	diagnostics.remotePlayerProxies = presence.All().size();
+	diagnostics.npcProxies = sharedNPCs.All().size();
+	diagnostics.staleProxyCount = staleProxyCount;
+	diagnostics.duplicatePreventionCount = duplicatePreventionCount;
+	return diagnostics;
 }
 
 
@@ -2625,6 +2831,8 @@ void CoOpRelay::ClientSession::StartJoin(string playerName, string password)
 	recentEvents.clear();
 	desyncWarnings.clear();
 	connectionStep = 0;
+	staleProxyCount = 0;
+	duplicatePreventionCount = 0;
 	emitter.SetEnabled(false);
 	state = ConnectionState::CONNECTING;
 }
@@ -2656,6 +2864,8 @@ void CoOpRelay::ClientSession::Disconnect()
 	recentEvents.clear();
 	desyncWarnings.clear();
 	connectionStep = 0;
+	staleProxyCount = 0;
+	duplicatePreventionCount = 0;
 	emitter.SetEnabled(false);
 	state = ConnectionState::DISCONNECTED;
 }
@@ -2687,6 +2897,8 @@ void CoOpRelay::ClientSession::SetError(string reason)
 	recentEvents.clear();
 	desyncWarnings.clear();
 	connectionStep = 0;
+	staleProxyCount = 0;
+	duplicatePreventionCount = 0;
 	emitter.SetEnabled(false);
 	state = ConnectionState::ERROR;
 }
@@ -2727,12 +2939,16 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 			return false;
 		if(const RemotePresence *presence = remotes.Get(snapshot->playerId))
 			if(snapshot->sequence == presence->latest.sequence)
+			{
+				++duplicatePreventionCount;
 				return false;
+			}
 		if(remotes.Apply(*snapshot))
 		{
 			NoteRemoteSnapshot(*snapshot);
 			return true;
 		}
+		++staleProxyCount;
 		RecordDesyncWarning("Ignored stale presence from "
 			+ (snapshot->name.empty() ? snapshot->playerId : snapshot->name) + ".");
 		return false;
@@ -2742,7 +2958,10 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 		if(event->playerId == playerId)
 			return false;
 		if(!AcceptEvent(*event))
+		{
+			++staleProxyCount;
 			return false;
+		}
 		recentEvents.push_back(*event);
 		if(recentEvents.size() > 20)
 			recentEvents.erase(recentEvents.begin());
@@ -2752,6 +2971,7 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 	{
 		if(authorities.Apply(*authority))
 			return true;
+		++staleProxyCount;
 		RecordDesyncWarning("Ignored stale authority update for " + authority->system + ".");
 		return false;
 	}
@@ -2761,6 +2981,7 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 			return false;
 		if(peerEndpointStore.Apply(*endpoint))
 			return true;
+		++staleProxyCount;
 		RecordDesyncWarning("Ignored stale peer endpoint from " + endpoint->playerId + ".");
 		return false;
 	}
@@ -2768,9 +2989,13 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 	{
 		if(const SharedNPCSnapshot *stored = sharedNPCs.Get(npc->npcId))
 			if(SameNPCSnapshot(*npc, *stored))
+			{
+				++duplicatePreventionCount;
 				return false;
+			}
 		if(sharedNPCs.Apply(*npc))
 			return true;
+		++staleProxyCount;
 		RecordDesyncWarning("Ignored stale shared NPC update for " + npc->npcId + ".");
 		return false;
 	}
@@ -2782,8 +3007,13 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 		if(!AcceptNPCDamageReport(*damage, &exactDuplicate))
 		{
 			if(!exactDuplicate)
+			{
+				++staleProxyCount;
 				RecordDesyncWarning("Ignored stale damage report from " + damage->reporterId
 					+ " for " + damage->npcId + ".");
+			}
+			else
+				++duplicatePreventionCount;
 			return false;
 		}
 		npcDamageReports.push_back(*damage);
@@ -2797,7 +3027,12 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 		if(!AcceptCombatHit(*hit, &exactDuplicate))
 		{
 			if(!exactDuplicate)
+			{
+				++staleProxyCount;
 				RecordDesyncWarning("Ignored stale combat hit from " + hit->attackerId + ".");
+			}
+			else
+				++duplicatePreventionCount;
 			return false;
 		}
 		combatHits.push_back(*hit);
@@ -2811,7 +3046,12 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 		if(!AcceptWeaponFire(*fire, &exactDuplicate))
 		{
 			if(!exactDuplicate)
+			{
+				++staleProxyCount;
 				RecordDesyncWarning("Ignored stale weapon fire from " + fire->playerId + ".");
+			}
+			else
+				++duplicatePreventionCount;
 			return false;
 		}
 		weaponFires.push_back(*fire);
@@ -2826,10 +3066,13 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 		{
 			if(!exactDuplicate)
 			{
+				++staleProxyCount;
 				const string source = boarding->IsRequest() ? boarding->playerId : boarding->ownerId;
 				RecordDesyncWarning("Ignored stale boarding report from " + source
 					+ " for " + boarding->npcId + ".");
 			}
+			else
+				++duplicatePreventionCount;
 			return false;
 		}
 		npcBoardingReports.push_back(*boarding);
@@ -2841,6 +3084,7 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 			return false;
 		if(!missionEventLog.Apply(*mission))
 		{
+			++staleProxyCount;
 			RecordDesyncWarning("Ignored stale mission event from " + mission->playerId
 				+ " for " + mission->instanceId + ".");
 			return false;
@@ -2856,6 +3100,7 @@ bool CoOpRelay::ClientSession::ReceiveRelayLine(const string &line)
 			return false;
 		if(!resourceEventLog.Apply(*resource))
 		{
+			++staleProxyCount;
 			RecordDesyncWarning("Ignored stale resource event from " + resource->playerId
 				+ " for " + resource->actionId + ".");
 			return false;
@@ -2891,6 +3136,7 @@ void CoOpRelay::ClientSession::StepConnectionHealth(unsigned steps)
 		if(presence && !presence->latest.name.empty())
 			label = presence->latest.name;
 		RecordDesyncWarning("No recent presence snapshot from " + label + "; remote state may be stale.");
+		++staleProxyCount;
 		activity.staleWarningSent = true;
 	}
 }
@@ -3079,6 +3325,27 @@ const vector<CoOpRelay::PlayerEvent> &CoOpRelay::ClientSession::RecentEvents() c
 const vector<string> &CoOpRelay::ClientSession::DesyncWarnings() const noexcept
 {
 	return desyncWarnings;
+}
+
+
+
+CoOpRelay::Diagnostics CoOpRelay::ClientSession::GetDiagnostics() const
+{
+	Diagnostics diagnostics;
+	diagnostics.connectedPlayers = state == ConnectionState::CONNECTED ? remotes.All().size() + 1 : 0;
+	diagnostics.playerId = playerId;
+	diagnostics.remotePlayerProxies = remotes.All().size();
+	diagnostics.npcProxies = sharedNPCs.All().size();
+	diagnostics.staleProxyCount = staleProxyCount;
+	diagnostics.duplicatePreventionCount = duplicatePreventionCount;
+	if(!remoteSnapshotActivity.empty())
+	{
+		uint64_t newestSeenStep = 0;
+		for(const RemoteSnapshotActivity &activity : remoteSnapshotActivity)
+			newestSeenStep = max(newestSeenStep, activity.lastSeenStep);
+		diagnostics.lastSnapshotAgeSteps = connectionStep >= newestSeenStep ? connectionStep - newestSeenStep : 0;
+	}
+	return diagnostics;
 }
 
 

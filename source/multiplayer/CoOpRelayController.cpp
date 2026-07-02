@@ -1165,6 +1165,9 @@ public:
 			relayLatencyMs = -1;
 			nextResyncSequence = 1;
 			pendingResyncSequence = 0;
+			snapshotRateWindowStart = {};
+			snapshotsInRateWindow = 0;
+			clientSnapshotRate = 0.;
 			outbound.clear();
 		}
 
@@ -1200,6 +1203,9 @@ public:
 		pendingPingSequence = 0;
 		pendingResyncSequence = 0;
 		relayLatencyMs = -1;
+		snapshotRateWindowStart = {};
+		snapshotsInRateWindow = 0;
+		clientSnapshotRate = 0.;
 		relayLocalHost.clear();
 		directEndpointPublished = false;
 		nextDirectEndpointSequence = 1;
@@ -1266,6 +1272,8 @@ public:
 				session.SetError();
 				return;
 			}
+			if(message.isSnapshot)
+				RecordSnapshotSent();
 			if(IsDirectRealtimeOutgoing(message.line))
 				directPeers.Send(message.line);
 		}
@@ -1307,6 +1315,15 @@ public:
 		if(pendingResyncSequence)
 			result += " - resyncing";
 		return result;
+	}
+
+	CoOpRelay::Diagnostics GetDiagnostics() const
+	{
+		CoOpRelay::Diagnostics diagnostics = session.GetDiagnostics();
+		lock_guard<std::mutex> lock(mutex);
+		diagnostics.clientSnapshotRate = clientSnapshotRate;
+		diagnostics.latencyMs = relayLatencyMs;
+		return diagnostics;
 	}
 
 	const CoOpRelay::PresenceStore &Remotes() const
@@ -1571,6 +1588,22 @@ private:
 		return true;
 	}
 
+	void RecordSnapshotSent()
+	{
+		lock_guard<std::mutex> lock(mutex);
+		const auto now = chrono::steady_clock::now();
+		if(snapshotRateWindowStart == chrono::steady_clock::time_point{})
+			snapshotRateWindowStart = now;
+		++snapshotsInRateWindow;
+		const auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - snapshotRateWindowStart);
+		if(elapsed.count() >= 1000)
+		{
+			clientSnapshotRate = snapshotsInRateWindow * 1000. / max<int64_t>(1, elapsed.count());
+			snapshotsInRateWindow = 0;
+			snapshotRateWindowStart = now;
+		}
+	}
+
 	void WriteLoop()
 	{
 		while(true)
@@ -1714,6 +1747,9 @@ private:
 	int relayLatencyMs = -1;
 	uint64_t nextResyncSequence = 1;
 	uint64_t pendingResyncSequence = 0;
+	chrono::steady_clock::time_point snapshotRateWindowStart;
+	uint64_t snapshotsInRateWindow = 0;
+	double clientSnapshotRate = 0.;
 	DirectPeerMesh directPeers;
 	string relayLocalHost;
 	bool directEndpointPublished = false;
@@ -1729,7 +1765,7 @@ public:
 		Stop();
 	}
 
-	bool Start(uint16_t port, string password = {})
+	bool Start(uint16_t port, string password = {}, bool serverWorldEnabled = false)
 	{
 		Stop();
 
@@ -1747,11 +1783,12 @@ public:
 			this->port = port;
 			listenSocket = listener;
 			core = CoOpRelay::RelayServerCore();
-			// Keep the production relay local-authoritative: real Endless Sky clients
-			// simulate NPCs with the vanilla AI and the relay only forwards snapshots.
-			core.SetServerWorldEnabled(false);
+			core.SetServerWorldEnabled(serverWorldEnabled);
 			core.SetRoomPassword(std::move(password));
 			status = "Hosting on port " + to_string(port);
+			if(serverWorldEnabled)
+				status += " (experimental server-world)";
+			serverTickRate = 0.;
 		}
 		stop = false;
 		acceptThread = thread(&LocalRelayHost::AcceptLoop, this, listener);
@@ -1790,6 +1827,7 @@ public:
 			core = CoOpRelay::RelayServerCore();
 			status = "Host stopped";
 			port = 0;
+			serverTickRate = 0.;
 		}
 		for(thread &clientThread : threads)
 			if(clientThread.joinable())
@@ -1824,6 +1862,14 @@ public:
 	{
 		lock_guard<std::mutex> lock(mutex);
 		return core.PlayerCount();
+	}
+
+	CoOpRelay::Diagnostics GetDiagnostics() const
+	{
+		lock_guard<std::mutex> lock(mutex);
+		CoOpRelay::Diagnostics diagnostics = core.GetDiagnostics();
+		diagnostics.serverTickRate = serverTickRate;
+		return diagnostics;
 	}
 
 	void SetPassword(string password)
@@ -2097,12 +2143,23 @@ private:
 	void WorldLoop()
 	{
 		auto nextStep = chrono::steady_clock::now();
+		auto tickWindowStart = nextStep;
+		uint64_t ticksInWindow = 0;
 		while(!stop)
 		{
 			vector<CoOpRelay::RelayDelivery> deliveries;
 			{
 				lock_guard<std::mutex> lock(mutex);
 				deliveries = core.StepServerWorld();
+				++ticksInWindow;
+				const auto now = chrono::steady_clock::now();
+				const auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - tickWindowStart);
+				if(elapsed.count() >= 1000)
+				{
+					serverTickRate = ticksInWindow * 1000. / max<int64_t>(1, elapsed.count());
+					ticksInWindow = 0;
+					tickWindowStart = now;
+				}
 			}
 			BroadcastDeliveries(deliveries);
 			nextStep += chrono::milliseconds(16);
@@ -2171,6 +2228,7 @@ private:
 	uint16_t port = 0;
 	string status = "Host stopped";
 	CoOpRelay::RelayServerCore core;
+	double serverTickRate = 0.;
 	map<string, SocketHandle> peerSockets;
 };
 
@@ -2183,7 +2241,7 @@ public:
 		CloseHandles();
 	}
 
-	bool Start(uint16_t port, string roomName, string password)
+	bool Start(uint16_t port, string roomName, string password, bool serverWorldEnabled = false)
 	{
 		CloseHandles();
 		const bool passwordProtected = !password.empty();
@@ -2200,6 +2258,8 @@ public:
 		command += " --coop-relay-room " + CommandLineQuote(std::move(roomName));
 		if(passwordProtected)
 			command += " --coop-relay-password " + CommandLineQuote(std::move(password));
+		if(serverWorldEnabled)
+			command += " --coop-server-world";
 
 		STARTUPINFOA startup = {};
 		startup.cb = sizeof(startup);
@@ -2708,16 +2768,17 @@ CoOpRelayController::~CoOpRelayController() = default;
 
 
 
-bool CoOpRelayController::StartHost(uint16_t port, string roomName, string password, bool allowDetached)
+bool CoOpRelayController::StartHost(uint16_t port, string roomName, string password, bool allowDetached,
+	bool serverWorldEnabled)
 {
-	if(allowDetached && detachedHost && detachedHost->Start(port, roomName, password))
+	if(allowDetached && detachedHost && detachedHost->Start(port, roomName, password, serverWorldEnabled))
 	{
 		host->Stop();
 		discovery->Advertise(false);
 		return true;
 	}
 
-	const bool started = host->Start(port, std::move(password));
+	const bool started = host->Start(port, std::move(password), serverWorldEnabled);
 	if(started)
 		discovery->Advertise(true, port, std::move(roomName), host->HasPassword(),
 			static_cast<int>(host->PlayerCount()));
@@ -3303,6 +3364,29 @@ const vector<string> &CoOpRelayController::DesyncWarnings() const
 {
 	static const vector<string> empty;
 	return client ? client->DesyncWarnings() : empty;
+}
+
+
+
+CoOpRelay::Diagnostics CoOpRelayController::DiagnosticsFor(const PlayerInfo &player) const
+{
+	CoOpRelay::Diagnostics diagnostics = client ? client->GetDiagnostics() : CoOpRelay::Diagnostics();
+	if(host && host->IsRunning())
+	{
+		const CoOpRelay::Diagnostics hostDiagnostics = host->GetDiagnostics();
+		diagnostics.serverWorldEnabled = hostDiagnostics.serverWorldEnabled;
+		diagnostics.serverTickRate = hostDiagnostics.serverTickRate;
+		diagnostics.staleProxyCount += hostDiagnostics.staleProxyCount;
+		diagnostics.duplicatePreventionCount += hostDiagnostics.duplicatePreventionCount;
+		if(!diagnostics.connectedPlayers)
+			diagnostics.connectedPlayers = hostDiagnostics.connectedPlayers;
+	}
+
+	const System *system = player.GetSystem();
+	if(system)
+		if(const CoOpRelay::SystemAuthority *authority = Authorities().Get(system->TrueName()))
+			diagnostics.authorityOwner = authority->ownerId;
+	return diagnostics;
 }
 
 

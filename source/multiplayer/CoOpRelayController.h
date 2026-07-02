@@ -54,7 +54,7 @@ public:
 	~CoOpRelayController();
 
 	bool StartHost(uint16_t port = 5050, std::string roomName = {}, std::string password = {},
-		bool allowDetached = true);
+		bool allowDetached = true, bool serverWorldEnabled = false);
 	void SetHostRoomName(std::string roomName);
 	void SetHostRoomPassword(std::string roomName, std::string password);
 	void StopHost();
@@ -104,6 +104,7 @@ public:
 	bool IsSystemAuthority(const std::string &system) const;
 	const std::vector<CoOpRelay::PlayerEvent> &RecentEvents() const;
 	const std::vector<std::string> &DesyncWarnings() const;
+	CoOpRelay::Diagnostics DiagnosticsFor(const PlayerInfo &player) const;
 	DrawStats LastDrawStats() const;
 	std::vector<DiscoveredRelay> DiscoveredRelays() const;
 

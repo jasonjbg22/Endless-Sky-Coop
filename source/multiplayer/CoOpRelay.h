@@ -451,6 +451,21 @@ public:
 		bool isEvent = false;
 	};
 
+	struct Diagnostics {
+		size_t connectedPlayers = 0;
+		std::string playerId;
+		std::string authorityOwner;
+		bool serverWorldEnabled = false;
+		size_t remotePlayerProxies = 0;
+		size_t npcProxies = 0;
+		uint64_t staleProxyCount = 0;
+		uint64_t duplicatePreventionCount = 0;
+		uint64_t lastSnapshotAgeSteps = 0;
+		double serverTickRate = 0.;
+		double clientSnapshotRate = 0.;
+		int latencyMs = -1;
+	};
+
 	struct RelayEndpoint {
 		std::string host = "127.0.0.1";
 		uint16_t port = DEFAULT_PORT;
@@ -503,6 +518,7 @@ public:
 
 		size_t PlayerCount() const noexcept;
 		const PresenceStore &Presence() const noexcept;
+		Diagnostics GetDiagnostics() const;
 
 	private:
 		struct Peer {
@@ -549,6 +565,7 @@ public:
 			Point destination;
 			uint64_t courseSeed = 0;
 			uint64_t lastPublishedStep = 0;
+			uint64_t lastWeaponFireStep = 0;
 		};
 		bool serverWorldEnabled = false;
 		uint64_t serverWorldStep = 0;
@@ -557,6 +574,9 @@ public:
 		uint64_t nextServerBoardingSequence = 1;
 		uint64_t nextServerMissionEventSequence = 1;
 		uint64_t nextServerResourceEventSequence = 1;
+		uint64_t nextServerWeaponFireSequence = 1;
+		uint64_t staleProxyCount = 0;
+		uint64_t duplicatePreventionCount = 0;
 		std::vector<ServerNPC> serverNPCs;
 	};
 
@@ -592,6 +612,7 @@ public:
 		bool IsSystemAuthority(const std::string &system) const;
 		const std::vector<PlayerEvent> &RecentEvents() const noexcept;
 		const std::vector<std::string> &DesyncWarnings() const noexcept;
+		Diagnostics GetDiagnostics() const;
 		LocalStateEmitter &Emitter() noexcept;
 		const LocalStateEmitter &Emitter() const noexcept;
 
@@ -660,6 +681,8 @@ public:
 		std::vector<PlayerEvent> recentEvents;
 		std::vector<std::string> desyncWarnings;
 		uint64_t connectionStep = 0;
+		uint64_t staleProxyCount = 0;
+		uint64_t duplicatePreventionCount = 0;
 		LocalStateEmitter emitter;
 	};
 

@@ -79,4 +79,5 @@ private:
 	uint16_t pendingJoinPort = 0;
 	int selectedDiscovery = -1;
 	std::string resourceTargetPlayerId;
+	bool diagnosticsVisible = false;
 };

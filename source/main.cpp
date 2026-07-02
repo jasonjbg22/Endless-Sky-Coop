@@ -90,7 +90,7 @@ using namespace std;
 
 void PrintHelp();
 void PrintVersion();
-int RunCoOpRelayServer(uint16_t port, string roomName, string password);
+int RunCoOpRelayServer(uint16_t port, string roomName, string password, bool serverWorldEnabled);
 void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversation,
 	const string &testToRun, bool debugMode, const optional<CoOpRelay::RelayEndpoint> &coOpRelayEndpoint,
 	string coOpRelayPassword);
@@ -122,6 +122,7 @@ int main(int argc, char *argv[])
 	optional<uint16_t> coOpRelayServerPort;
 	string coOpRelayServerRoom = "Co-op Relay";
 	string coOpRelayPassword;
+	bool coOpServerWorld = false;
 
 	// Whether the game has encountered errors while loading.
 	bool hasErrors = false;
@@ -175,6 +176,8 @@ int main(int argc, char *argv[])
 			coOpRelayServerRoom = *it;
 		else if(arg == "--coop-relay-password" && *++it)
 			coOpRelayPassword = *it;
+		else if(arg == "--coop-server-world")
+			coOpServerWorld = true;
 		else if(arg == "--tests")
 			printTests = true;
 		else if(arg == "--nomute")
@@ -207,7 +210,7 @@ int main(int argc, char *argv[])
 		}
 
 		return RunCoOpRelayServer(*coOpRelayServerPort, std::move(coOpRelayServerRoom),
-			std::move(coOpRelayPassword));
+			std::move(coOpRelayPassword), coOpServerWorld);
 	}
 	printData = PrintData::IsPrintDataArgument(argv);
 	Files::Init(argv);
@@ -721,6 +724,7 @@ void PrintHelp()
 	cerr << "    --coop-relay-server [port]: run a standalone Co-op Relay room until the process exits." << endl;
 	cerr << "    --coop-relay-room <name>: set the standalone Co-op Relay room name." << endl;
 	cerr << "    --coop-relay-password <password>: set the Co-op Relay room password for hosting or joining." << endl;
+	cerr << "    --coop-server-world: enable experimental server-owned NPC simulation for standalone relay hosts." << endl;
 	cerr << "    --nomute: don't mute the game while running tests." << endl;
 	cerr << "    --rng-seed <seed>: every time the pseudo-random number generator is seeded,"
 		" it will be given this value." << endl;
@@ -750,16 +754,18 @@ void PrintVersion()
 
 
 
-int RunCoOpRelayServer(uint16_t port, string roomName, string password)
+int RunCoOpRelayServer(uint16_t port, string roomName, string password, bool serverWorldEnabled)
 {
 	CoOpRelayController &relay = CoOpRelayController::Get();
-	if(!relay.StartHost(port, roomName, password, false))
+	if(!relay.StartHost(port, roomName, password, false, serverWorldEnabled))
 	{
 		cerr << "Failed to start Co-op Relay server: " << relay.HostStatusText() << endl;
 		return 1;
 	}
 
 	cout << "Co-op Relay room \"" << roomName << "\" listening on port " << port << "." << endl;
+	if(serverWorldEnabled)
+		cout << "Experimental server-world NPC simulation is enabled." << endl;
 	if(!password.empty())
 		cout << "Password protection is enabled." << endl;
 	cout << "Leave this window open. Press Ctrl+C or close it to stop the room." << endl;
