@@ -52,7 +52,9 @@ private:
 	void HostRoom();
 	void PlayHost();
 	void JoinLocal();
+	void JoinAddressPrompt();
 	void JoinAddress(const std::string &address);
+	void JoinAddressWithPassword(const std::string &password);
 	void SelectDiscovered(std::size_t index);
 	void JoinSelected();
 	void JoinSelectedWithPassword(const std::string &password);
@@ -71,6 +73,7 @@ private:
 	UI &gamePanels;
 	std::string roomName;
 	std::string roomPassword;
+	std::string directAddress = "host-public-ip:5050";
 	uint16_t roomPort = 5050;
 	std::string pendingJoinHost;
 	uint16_t pendingJoinPort = 0;
