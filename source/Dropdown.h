@@ -81,6 +81,7 @@ private:
 
 private:
 	int IdxFromPoint(int x, int y) const;
+	void CloseDroppedPanel(const Panel *panel);
 
 
 private:

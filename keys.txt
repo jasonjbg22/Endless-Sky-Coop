@@ -14,6 +14,7 @@
 "Initiate hyperspace jump" 106
 "Select next ship" 110
 "Select nearest hostile ship" 114
+"Select nearest co-op player" 111
 "Select nearest asteroid" 118
 "Deploy / recall fighters" 100
 "Fire afterburner" 97

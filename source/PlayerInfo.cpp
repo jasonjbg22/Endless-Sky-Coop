@@ -30,6 +30,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Government.h"
 #include "Logger.h"
 #include "Messages.h"
+#include "multiplayer/CoOpRelayController.h"
 #include "Outfit.h"
 #include "Person.h"
 #include "PilotProfile.h"
@@ -2267,8 +2268,8 @@ void PlayerInfo::CacheMissionInformation(Mission &mission, const DistanceMap &he
 		int systemCount = toVisit.size();
 		for(int i = 0; i < systemCount; ++i)
 		{
-			const System *closest;
-			int minimalDist = numeric_limits<int>::max();
+			const System *closest = *toVisit.begin();
+			int minimalDist = distance.Days(*closest);
 			for(const System *sys : toVisit)
 				if(distance.Days(*sys) < minimalDist)
 				{
@@ -4570,6 +4571,77 @@ void PlayerInfo::RegisterDerivedConditions()
 			return false;
 		string attribute = ce.NameWithoutPrefix();
 		return flagship->GetPlanet()->Attributes().contains(attribute); });
+
+	// Read-only co-op relay presence conditions for integration tests and diagnostics.
+	conditions["coop connected"].ProvideNamed([](const ConditionEntry &ce) -> bool {
+		return CoOpRelayController::Get().IsConnected(); });
+	conditions["coop direct peers"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return CoOpRelayController::Get().DirectPeerCount(); });
+	conditions["coop remote players"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return static_cast<int64_t>(CoOpRelayController::Get().Remotes().All().size()); });
+	conditions["coop remote players in system: "].ProvidePrefixed([](const ConditionEntry &ce) -> int64_t {
+		const string system = ce.NameWithoutPrefix();
+		int64_t count = 0;
+		for(const CoOpRelay::RemotePresence &presence : CoOpRelayController::Get().Remotes().All())
+			if(presence.latest.system == system)
+				++count;
+		return count;
+	});
+	conditions["coop remote players flying in system: "].ProvidePrefixed([](const ConditionEntry &ce) -> int64_t {
+		const string system = ce.NameWithoutPrefix();
+		int64_t count = 0;
+		for(const CoOpRelay::RemotePresence &presence : CoOpRelayController::Get().Remotes().All())
+			if(presence.IsInSystem(system))
+				++count;
+		return count;
+	});
+	conditions["coop remote players landed"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		int64_t count = 0;
+		for(const CoOpRelay::RemotePresence &presence : CoOpRelayController::Get().Remotes().All())
+			if(presence.latest.IsLanded())
+				++count;
+		return count;
+	});
+	conditions["coop remote players landed on: "].ProvidePrefixed([](const ConditionEntry &ce) -> int64_t {
+		const string planet = ce.NameWithoutPrefix();
+		int64_t count = 0;
+		for(const CoOpRelay::RemotePresence &presence : CoOpRelayController::Get().Remotes().All())
+			if(presence.latest.landedPlanet == planet)
+				++count;
+		return count;
+	});
+	conditions["coop remote minimum fuel"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		bool hasRemote = false;
+		int64_t minimumFuel = 0;
+		for(const CoOpRelay::RemotePresence &presence : CoOpRelayController::Get().Remotes().All())
+		{
+			const int64_t fuel = static_cast<int64_t>(presence.latest.fuel);
+			if(!hasRemote || fuel < minimumFuel)
+				minimumFuel = fuel;
+			hasRemote = true;
+		}
+		return hasRemote ? minimumFuel : 0;
+	});
+	conditions["coop recent event: "].ProvidePrefixed([](const ConditionEntry &ce) -> int64_t {
+		const string type = ce.NameWithoutPrefix();
+		int64_t count = 0;
+		for(const CoOpRelay::PlayerEvent &event : CoOpRelayController::Get().RecentEvents())
+			if(type == CoOpRelay::ToString(event.type))
+				++count;
+		return count;
+	});
+	conditions["coop rendered same-system contacts"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return CoOpRelayController::Get().LastDrawStats().sameSystemContacts;
+	});
+	conditions["coop rendered flight contacts"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return CoOpRelayController::Get().LastDrawStats().visibleFlightContacts;
+	});
+	conditions["coop rendered roster rows"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return CoOpRelayController::Get().LastDrawStats().rosterRows;
+	});
+	conditions["coop rendered event rows"].ProvideNamed([](const ConditionEntry &ce) -> int64_t {
+		return CoOpRelayController::Get().LastDrawStats().eventRows;
+	});
 
 	// Read only exploration conditions.
 	conditions["visited planet: "].ProvidePrefixed([this](const ConditionEntry &ce) -> bool {

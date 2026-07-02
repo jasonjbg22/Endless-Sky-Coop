@@ -21,6 +21,7 @@ x64/
 Debug/
 install/
 Release/
+dist/
 *.layout
 *.depend
 scons-local*
@@ -30,6 +31,13 @@ scons-local*
 
 # Test Reports
 test-report.xml
+utils/__pycache__/
+tests/integration/config/errors.txt
+tests/integration/config/global conditions.txt
+tests/integration/config/pilots/
+tests/integration/config/plugins.txt
+tests/integration/config/recent.txt
+tests/integration/config/saves/
 
 # Generated documentation
 docs/api/

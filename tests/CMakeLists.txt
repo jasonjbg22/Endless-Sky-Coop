@@ -39,6 +39,7 @@ target_sources(EndlessSkyTests PRIVATE
 	unit/src/test_formationPattern.cpp
 	unit/src/test_main.cpp
 	unit/src/test_point.cpp
+	unit/src/test_coopRelay.cpp
 	unit/src/test_random.cpp
 	unit/src/test_scrollVar.cpp
 	unit/src/test_set.cpp
@@ -58,6 +59,7 @@ list(APPEND INTEGRATION_TESTS
 	integration/config/plugins/integration-tests/data/tests/tests_capture_override.txt
 	integration/config/plugins/integration-tests/data/tests/tests_common.txt
 	integration/config/plugins/integration-tests/data/tests/tests_conditional_choice.txt
+	integration/config/plugins/integration-tests/data/tests/tests_coop_relay.txt
 	integration/config/plugins/integration-tests/data/tests/tests_disown.txt
 	integration/config/plugins/integration-tests/data/tests/tests_flagship_attribute_autoconditions.txt
 	integration/config/plugins/integration-tests/data/tests/tests_flagship_model_condition.txt

@@ -1,0 +1,57 @@
+name: Co-op Friend Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version label, for example coop-v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows-portable:
+    name: Windows portable friend build
+    runs-on: windows-2025
+    env:
+      ASSET_NAME: EndlessSky-Coop-Windows.zip
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          show-progress: false
+
+      - uses: lukka/get-cmake@v4.2.3
+
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: '89dc8be6dbcf18482a5a1bf86a2f4615c939b0fb'
+
+      - name: Configure
+        run: cmake --preset mingw-release
+
+      - name: Build
+        run: cmake --build build --preset mingw-ci-release
+
+      - name: Install
+        run: cmake --install build/release
+
+      - name: Package portable build
+        shell: pwsh
+        run: |
+          ./packaging/coop/package-coop-release.ps1 `
+            -InstallDir ./install/release `
+            -OutputDir ./dist `
+            -Version "${{ inputs.version }}" `
+            -GitHubOwner "${{ github.repository_owner }}" `
+            -GitHubRepo "${{ github.event.repository.name }}" `
+            -AssetName "$env:ASSET_NAME"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Endless Sky Co-op ${{ inputs.version }}
+          prerelease: true
+          files: dist/${{ env.ASSET_NAME }}

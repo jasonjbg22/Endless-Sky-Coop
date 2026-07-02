@@ -282,7 +282,7 @@ bool Dropdown::DroppedPanel::Click(int x, int y, MouseButton, int clicks)
 	if(idx >= 0)
 		dd->SetSelectedIndex(idx);
 
-	dd->RemoveChild(this);
+	dd->CloseDroppedPanel(this);
 
 	return true;
 }
@@ -314,7 +314,7 @@ bool Dropdown::DroppedPanel::Release(int x, int y, MouseButton)
 		{
 			dd->SetSelectedIndex(idx);
 		}
-		dd->RemoveChild(this);
+		dd->CloseDroppedPanel(this);
 	}
 	return true;
 }
@@ -325,4 +325,11 @@ bool Dropdown::DroppedPanel::Hover(int x, int y)
 {
 	highlightIndex = dd->IdxFromPoint(x, y);
 	return true;
+}
+
+
+
+void Dropdown::CloseDroppedPanel(const Panel *panel)
+{
+	RemoveChild(panel);
 }

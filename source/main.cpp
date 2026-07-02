@@ -35,6 +35,8 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Logger.h"
 #include "MainPanel.h"
 #include "MenuPanel.h"
+#include "multiplayer/CoOpRelay.h"
+#include "multiplayer/CoOpRelayController.h"
 #include "Panel.h"
 #include "PlayerInfo.h"
 #include "Plugins.h"
@@ -62,7 +64,10 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include <cassert>
 #include <future>
 #include <exception>
+#include <limits>
+#include <optional>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #define STRICT
@@ -85,8 +90,10 @@ using namespace std;
 
 void PrintHelp();
 void PrintVersion();
+int RunCoOpRelayServer(uint16_t port, string roomName, string password);
 void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversation,
-	const string &testToRun, bool debugMode);
+	const string &testToRun, bool debugMode, const optional<CoOpRelay::RelayEndpoint> &coOpRelayEndpoint,
+	string coOpRelayPassword);
 Conversation LoadConversation(const PlayerInfo &player);
 void PrintTestsTable();
 
@@ -111,6 +118,10 @@ int main(int argc, char *argv[])
 	bool noTestMute = false;
 	uint64_t nWorkerThreads = 0;
 	string testToRunName;
+	optional<CoOpRelay::RelayEndpoint> coOpRelayEndpoint;
+	optional<uint16_t> coOpRelayServerPort;
+	string coOpRelayServerRoom = "Co-op Relay";
+	string coOpRelayPassword;
 
 	// Whether the game has encountered errors while loading.
 	bool hasErrors = false;
@@ -144,6 +155,26 @@ int main(int argc, char *argv[])
 			checkAssets = true;
 		else if(arg == "--test" && *++it)
 			testToRunName = *it;
+		else if(arg == "--coop-relay-connect" && *++it)
+			coOpRelayEndpoint = CoOpRelay::ParseEndpoint(*it);
+		else if(arg == "--coop-relay-server")
+		{
+			coOpRelayServerPort = CoOpRelay::DEFAULT_PORT;
+			if(*(it + 1) && string(*(it + 1)).rfind("-", 0) != 0)
+			{
+				unsigned long port = stoul(*++it);
+				if(!port || port > 65535)
+				{
+					cerr << "--coop-relay-server port must be between 1 and 65535." << endl;
+					return 1;
+				}
+				coOpRelayServerPort = static_cast<uint16_t>(port);
+			}
+		}
+		else if(arg == "--coop-relay-room" && *++it)
+			coOpRelayServerRoom = *it;
+		else if(arg == "--coop-relay-password" && *++it)
+			coOpRelayPassword = *it;
 		else if(arg == "--tests")
 			printTests = true;
 		else if(arg == "--nomute")
@@ -156,6 +187,28 @@ int main(int argc, char *argv[])
 
 	if(nWorkerThreads)
 		TaskQueue::SetWorkerThreadCount(nWorkerThreads);
+	if(coOpRelayServerPort)
+	{
+		Files::Init(argv);
+		Logger::Session logSession{true};
+		try {
+			Preferences::Load();
+			Plugins::LoadSettings();
+
+			TaskQueue queue;
+			auto dataFuture = GameData::BeginLoad(queue, player, true, debugMode, true);
+			dataFuture.wait();
+			GameData::FinishLoading();
+		}
+		catch(const exception &error)
+		{
+			cerr << "Failed to load game data for Co-op Relay server: " << error.what() << endl;
+			return 1;
+		}
+
+		return RunCoOpRelayServer(*coOpRelayServerPort, std::move(coOpRelayServerRoom),
+			std::move(coOpRelayPassword));
+	}
 	printData = PrintData::IsPrintDataArgument(argv);
 	Files::Init(argv);
 
@@ -261,7 +314,7 @@ int main(int argc, char *argv[])
 
 		CustomEvents::Init();
 		// This is the main loop where all the action begins.
-		GameLoop(player, queue, conversation, testToRunName, debugMode);
+		GameLoop(player, queue, conversation, testToRunName, debugMode, coOpRelayEndpoint, coOpRelayPassword);
 	}
 	catch(Test::known_failure_tag)
 	{
@@ -290,7 +343,8 @@ int main(int argc, char *argv[])
 
 
 void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversation,
-		const string &testToRunName, bool debugMode)
+		const string &testToRunName, bool debugMode, const optional<CoOpRelay::RelayEndpoint> &coOpRelayEndpoint,
+		string coOpRelayPassword)
 {
 	// gamePanels is used for the main panel where you fly your spaceship.
 	// All other game content related dialogs are placed on top of the gamePanels.
@@ -324,6 +378,29 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 		testContext = TestContext(GameData::Tests().Get(testToRunName));
 
 	const bool isHeadless = (testContext.CurrentTest() && !debugMode);
+	bool startedCoOpRelay = false;
+	auto StartCoOpRelayIfReady = [&]() {
+		if(!coOpRelayEndpoint || startedCoOpRelay || !player.IsLoaded())
+			return;
+
+		string name = player.FirstName();
+		if(!player.LastName().empty())
+		{
+			if(!name.empty())
+				name += " ";
+			name += player.LastName();
+		}
+		if(name.empty())
+			name = "Player";
+
+		CoOpRelayController::Get().Connect(coOpRelayEndpoint->host, coOpRelayEndpoint->port, std::move(name),
+			coOpRelayPassword);
+		startedCoOpRelay = true;
+	};
+	auto StepLaunchCoOpRelayIfMenuActive = [&]() {
+		if(startedCoOpRelay && !menuPanels.IsEmpty())
+			CoOpRelayController::Get().Step(player);
+	};
 
 	auto ProcessEvents = [&menuPanels, &gamePanels, &player, &cursorTime, &toggleTimeout, &debugMode, &isDebugPaused,
 			&isFastForward]
@@ -419,6 +496,8 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 			chrono::steady_clock::time_point start = chrono::steady_clock::now();
 
 			ProcessEvents();
+			StartCoOpRelayIfReady();
+			StepLaunchCoOpRelayIfMenuActive();
 
 			SDL_Keymod mod = SDL_GetModState();
 			Font::ShowUnderlines(mod & KMOD_ALT);
@@ -561,6 +640,8 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 		while(!menuPanels.IsDone())
 		{
 			ProcessEvents();
+			StartCoOpRelayIfReady();
+			StepLaunchCoOpRelayIfMenuActive();
 
 			// Handle any integration test steps.
 			if(dataFinishedLoading)
@@ -614,6 +695,9 @@ void GameLoop(PlayerInfo &player, TaskQueue &queue, const Conversation &conversa
 	// If player quit while landed on a planet, save the game if there are changes.
 	if(player.GetPlanet() && gamePanels.CanSave())
 		player.Save();
+
+	if(startedCoOpRelay)
+		CoOpRelayController::Get().Disconnect();
 }
 
 
@@ -633,6 +717,10 @@ void PrintHelp()
 		" and the latest save game, and inspect data for errors." << endl;
 	cerr << "    --tests: print table of available tests, then exit." << endl;
 	cerr << "    --test <name>: run given test from resources directory." << endl;
+	cerr << "    --coop-relay-connect <host[:port]>: connect to a Co-op Relay session once a pilot is loaded." << endl;
+	cerr << "    --coop-relay-server [port]: run a standalone Co-op Relay room until the process exits." << endl;
+	cerr << "    --coop-relay-room <name>: set the standalone Co-op Relay room name." << endl;
+	cerr << "    --coop-relay-password <password>: set the Co-op Relay room password for hosting or joining." << endl;
 	cerr << "    --nomute: don't mute the game while running tests." << endl;
 	cerr << "    --rng-seed <seed>: every time the pseudo-random number generator is seeded,"
 		" it will be given this value." << endl;
@@ -658,6 +746,39 @@ void PrintVersion()
 	cerr << endl;
 	cerr << GameWindow::SDLVersions() << endl;
 	cerr << endl;
+}
+
+
+
+int RunCoOpRelayServer(uint16_t port, string roomName, string password)
+{
+	CoOpRelayController &relay = CoOpRelayController::Get();
+	if(!relay.StartHost(port, roomName, password, false))
+	{
+		cerr << "Failed to start Co-op Relay server: " << relay.HostStatusText() << endl;
+		return 1;
+	}
+
+	cout << "Co-op Relay room \"" << roomName << "\" listening on port " << port << "." << endl;
+	if(!password.empty())
+		cout << "Password protection is enabled." << endl;
+	cout << "Leave this window open. Press Ctrl+C or close it to stop the room." << endl;
+
+	size_t lastPlayerCount = (numeric_limits<size_t>::max)();
+	while(relay.IsHostRunning())
+	{
+		relay.StepHost();
+		const size_t playerCount = relay.HostPlayerCount();
+		if(playerCount != lastPlayerCount)
+		{
+			cout << "Connected players: " << playerCount << endl;
+			lastPlayerCount = playerCount;
+		}
+		this_thread::sleep_for(chrono::milliseconds(250));
+	}
+
+	cerr << "Co-op Relay server stopped: " << relay.HostStatusText() << endl;
+	return 0;
 }
 
 

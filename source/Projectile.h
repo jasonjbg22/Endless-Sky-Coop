@@ -63,6 +63,9 @@ public:
 
 public:
 	Projectile(const Ship &parent, Point position, Angle angle, const Weapon *weapon);
+	// Visual-only remote projectile using already-authoritative motion data.
+	Projectile(Point position, Point velocity, Point ownVelocity, Angle angle, const Weapon *weapon,
+		const Government *government, std::shared_ptr<Ship> targetShip);
 	Projectile(const Projectile &parent, const Point &offset, const Angle &angle, const Weapon *weapon);
 	// Ship explosion.
 	Projectile(const Point &position, const Angle &angle, const Weapon *weapon);

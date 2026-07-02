@@ -22,6 +22,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "../../../../source/DataNode.h"
 
 // ... and any system includes needed for the test file.
+#include <limits>
 #include <string>
 
 namespace { // test namespace
@@ -161,9 +162,9 @@ TEST_CASE( "Format::Number", "[Format][Number]") {
 		CHECK( Format::Number(.0) == "0" );
 	}
 	SECTION( "Non-finite inputs" ) {
-		CHECK( Format::Number(0./0.) == "???" );
-		CHECK( Format::Number(1./0.) == "infinity" );
-		CHECK( Format::Number(-1./0.) == "-infinity" );
+		CHECK( Format::Number(std::numeric_limits<double>::quiet_NaN()) == "???" );
+		CHECK( Format::Number(std::numeric_limits<double>::infinity()) == "infinity" );
+		CHECK( Format::Number(-std::numeric_limits<double>::infinity()) == "-infinity" );
 	}
 	SECTION( "Integral inputs" ) {
 		CHECK( Format::Number(1) == "1" );

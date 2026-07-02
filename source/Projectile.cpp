@@ -29,6 +29,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 using namespace std;
 
@@ -97,6 +98,32 @@ Projectile::Projectile(const Ship &parent, Point position, Angle angle, const We
 		confusionDirection = Random::Int(2) ? -1 : 1;
 		CheckLock(cachedTarget, targetIsShip);
 		CheckConfused(*cachedTarget);
+	}
+}
+
+
+
+Projectile::Projectile(Point position, Point velocity, Point ownVelocity, Angle angle, const Weapon *weapon,
+	const Government *government, shared_ptr<Ship> targetShip)
+	: Body(weapon->WeaponSprite(), std::move(position), std::move(velocity), angle),
+	weapon(weapon), lifetime(weapon->Lifetime())
+{
+	this->government = government;
+	hitsRemaining = weapon->PenetrationCount();
+	dV = ownVelocity;
+	targetIsShip = static_cast<bool>(targetShip);
+	if(targetShip)
+	{
+		target = static_pointer_cast<Entity>(targetShip);
+		cachedTarget = targetShip.get();
+		targetGovernment = targetShip->GetGovernment();
+		targetDisabled = targetShip->IsDisabled();
+		if(weapon->Homing())
+		{
+			confusionDirection = Random::Int(2) ? -1 : 1;
+			CheckLock(cachedTarget, targetIsShip);
+			CheckConfused(*cachedTarget);
+		}
 	}
 }
 

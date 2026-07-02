@@ -29,6 +29,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Information.h"
 #include "MiniMap.h"
 #include "MouseButton.h"
+#include "multiplayer/CoOpRelay.h"
 #include "PlanetLabel.h"
 #include "Point.h"
 #include "Preferences.h"
@@ -38,9 +39,12 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "TaskQueue.h"
 
 #include <condition_variable>
+#include <cstdint>
+#include <cstddef>
 #include <list>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -83,6 +87,8 @@ public:
 	void Go();
 	// Whether the player has the game paused.
 	bool IsPaused() const;
+	// Whether co-op needs this engine to keep simulating shared NPCs behind a UI panel.
+	bool ShouldRunCoOpBackgroundSimulation() const;
 
 	// Give a command on behalf of the player, used for integration tests.
 	void GiveCommand(const Command &command);
@@ -93,6 +99,10 @@ public:
 
 	// Draw a frame.
 	void Draw() const;
+	// Get the current camera center and zoom used to draw flight-space overlays.
+	Point ViewCenter() const;
+	double ViewportZoom() const;
+	bool HasCoOpPlayerProxy(const std::string &playerId) const;
 
 	// Select the object the player clicked on.
 	void Click(const Point &from, const Point &to, bool hasShift, bool hasControl);
@@ -166,6 +176,32 @@ private:
 		bool isBlind;
 	};
 
+	class CoOpNPCRecord {
+	public:
+		std::string id;
+		std::string system;
+		bool missionDisabled = false;
+		bool missionDestroyed = false;
+		bool missionBoarded = false;
+		bool missionCaptured = false;
+	};
+
+	class CoOpNPCProxyMotion {
+	public:
+		uint64_t previousSequence = 0;
+		uint64_t latestSequence = 0;
+		Point previousPosition;
+		Point latestPosition;
+		Point previousVelocity;
+		Point latestVelocity;
+		Angle previousFacing;
+		Angle latestFacing;
+		int previousStep = 0;
+		int latestStep = 0;
+		bool hasPrevious = false;
+		bool hasLatest = false;
+	};
+
 	class Zoom {
 	public:
 		constexpr Zoom() : base(0.) {}
@@ -187,6 +223,27 @@ private:
 
 	void MoveShip(const std::shared_ptr<Ship> &ship);
 
+	void SyncCoOpNPCProxies();
+	void SyncCoOpPlayerProxies();
+	void ApplyCoOpWeaponFires();
+	void ApplyCoOpCombatHits();
+	void ApplyCoOpNPCDamageReports();
+	void ApplyCoOpNPCBoardingReports();
+	void PublishCoOpNPCSnapshots();
+	void PublishCoOpNPCSnapshot(const Ship &ship, CoOpNPCRecord &record, bool captured = false, bool removed = false);
+	void ReportCoOpNPCDamage(const std::shared_ptr<Ship> &ship, double shields, double hull, double fuel,
+		double energy, double heat);
+	void ReportCoOpCombatHit(const std::shared_ptr<Ship> &ship, double shields, double hull, double fuel,
+		double energy, double heat, const std::string &weapon, const Point &impactPosition,
+		const Point &hitVelocity, double facing);
+	void ReportCoOpWeaponFire(const Ship &ship, std::size_t firstProjectile);
+	bool AddCoOpRemoteWeaponVisual(const std::string &playerId, const std::string &system, const std::string &weapon,
+		const Point &projectilePosition, const Point &effectPosition, const Point &to, const Point &velocity,
+		const Point &ownVelocity, double facing, const std::string &targetPlayerId, const std::string &targetNPCId);
+	void AddCoOpRemoteWeaponTracer(const Point &from, const Point &to, const Color &color, int lifetime);
+	void AddCoOpRemoteHitWeaponVisual(const CoOpRelay::SharedCombatHit &hit);
+	void AddCoOpRemoteHitVisual(const std::string &weapon, const Point &impactPosition,
+		const Point &hitVelocity, double facing);
 	void SpawnFleets();
 	void SpawnPersons();
 	void GenerateWeather();
@@ -194,6 +251,8 @@ private:
 	void HandleKeyboardInputs();
 	void HandleMouseClicks();
 	void HandleMouseInput(Command &activeCommands);
+	bool IsSelectableCoOpPlayerProxy(const Ship &ship) const;
+	bool TargetNearestCoOpPlayer();
 
 	void FillCollisionSets();
 
@@ -217,17 +276,44 @@ private:
 	PlayerInfo &player;
 
 	std::list<std::shared_ptr<Ship>> ships;
+	std::map<std::string, std::shared_ptr<Ship>> coOpPlayerProxies;
+	std::map<std::string, CoOpNPCProxyMotion> coOpPlayerProxyMotion;
+	std::map<std::string, std::shared_ptr<Ship>> coOpNPCProxies;
+	std::map<std::string, CoOpNPCProxyMotion> coOpNPCProxyMotion;
+	std::map<const Ship *, CoOpNPCRecord> coOpNPCs;
+	std::string coOpNPCOwnerId;
+	uint64_t coOpNextNPCId = 1;
+	uint64_t coOpNextNPCSequence = 1;
+	uint64_t coOpNextNPCDamageSequence = 1;
+	uint64_t coOpNextCombatHitSequence = 1;
+	uint64_t coOpNextWeaponFireSequence = 1;
+	uint64_t coOpNextMissionEventSequence = 1;
+	uint64_t coOpNextResourceEventSequence = 1;
+	int coOpLastNPCPublishStep = -1;
+	struct CoOpRemoteWeaponTracer {
+		Point from;
+		Point to;
+		Color color;
+		int lifetime = 0;
+		int initialLifetime = 0;
+	};
 	std::vector<Projectile> projectiles;
+	std::vector<Projectile> coOpRemoteProjectiles;
+	std::vector<CoOpRemoteWeaponTracer> coOpRemoteWeaponTracers;
+	std::vector<CoOpRelay::SharedWeaponFire> coOpPendingWeaponFires;
 	std::vector<Weather> activeWeather;
 	std::list<std::shared_ptr<Flotsam>> flotsam;
 	std::vector<Visual> visuals;
+	std::vector<Visual> coOpRemoteVisuals;
 	AsteroidField asteroids;
 
 	// New objects created within the latest step:
 	std::list<std::shared_ptr<Ship>> newShips;
 	std::vector<Projectile> newProjectiles;
+	std::vector<Projectile> coOpNewRemoteProjectiles;
 	std::list<std::shared_ptr<Flotsam>> newFlotsam;
 	std::vector<Visual> newVisuals;
+	std::vector<Visual> coOpNewRemoteVisuals;
 
 	// Track which ships currently have anti-missiles or
 	// tractor beams ready to fire.

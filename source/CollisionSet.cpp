@@ -184,7 +184,9 @@ void CollisionSet::Line(const Point &from, const Point &to, vector<Collision> &l
 			// Check if this projectile can hit this object. If either the
 			// projectile or the object has no government, it will always hit.
 			const Government *iGov = it->body->GetGovernment();
-			if(it->body != target && iGov && pGov && !iGov->IsEnemy(pGov))
+			const bool isCoOpProxyShip = collisionType == CollisionType::SHIP
+				&& !static_cast<const Ship *>(it->body)->CoOpProxyId().empty();
+			if(!isCoOpProxyShip && it->body != target && iGov && pGov && !iGov->IsEnemy(pGov))
 				continue;
 
 			const Mask &mask = it->body->GetMask(step);
@@ -258,7 +260,9 @@ void CollisionSet::Line(const Point &from, const Point &to, vector<Collision> &l
 			// Check if this projectile can hit this object. If either the
 			// projectile or the object has no government, it will always hit.
 			const Government *iGov = it->body->GetGovernment();
-			if(it->body != target && iGov && pGov && !iGov->IsEnemy(pGov))
+			const bool isCoOpProxyShip = collisionType == CollisionType::SHIP
+				&& !static_cast<const Ship *>(it->body)->CoOpProxyId().empty();
+			if(!isCoOpProxyShip && it->body != target && iGov && pGov && !iGov->IsEnemy(pGov))
 				continue;
 
 			const Mask &mask = it->body->GetMask(step);

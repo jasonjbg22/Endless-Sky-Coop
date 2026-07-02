@@ -1,0 +1,5 @@
+# Copy this to update-config.txt in the packaged game folder.
+# Friends do not need GitHub accounts; this only tells the updater where releases live.
+owner=CHANGE_ME
+repo=CHANGE_ME
+asset=EndlessSky-Coop-Windows.zip

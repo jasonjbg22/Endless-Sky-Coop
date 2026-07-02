@@ -28,6 +28,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "LoadPanel.h"
 #include "Logger.h"
 #include "MainPanel.h"
+#include "multiplayer/CoOpRelayPanel.h"
 #include "pi.h"
 #include "PilotProfile.h"
 #include "Planet.h"
@@ -36,9 +37,11 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "PreferencesPanel.h"
 #include "Ship.h"
 #include "image/Sprite.h"
+#include "shader/FillShader.h"
 #include "shader/StarField.h"
 #include "StartConditionsPanel.h"
 #include "System.h"
+#include "Screen.h"
 #include "UI.h"
 
 #include "opengl.h"
@@ -181,6 +184,17 @@ void MenuPanel::Draw()
 
 	if(!credits.empty())
 		DrawCredits();
+
+	const Font &font = FontSet::Get(14);
+	const string coOpLabel = "Co-op Relay [C]";
+	const Point buttonSize(max(150., font.Width(coOpLabel) + 28.), 26.);
+	const Rectangle coOpButton(Screen::BottomRight() - buttonSize * .5 - Point(24., 24.), buttonSize);
+	FillShader::Fill(coOpButton, Color(0.f, .55f));
+	FillShader::Fill(Rectangle::FromCorner(coOpButton.TopLeft(), Point(coOpButton.Width(), 1.)),
+		*GameData::Colors().Get("medium"));
+	font.Draw(coOpLabel, coOpButton.Center() - .5 * Point(font.Width(coOpLabel), font.Height()),
+		*GameData::Colors().Get("bright"));
+	AddZone(coOpButton, 'c');
 }
 
 
@@ -210,6 +224,8 @@ bool MenuPanel::KeyDown(SDL_Keycode key, Uint16 mod, const Command &command, boo
 	}
 	else if(key == 'p')
 		GetUI().Push(new PreferencesPanel(player));
+	else if(key == 'c')
+		GetUI().Push(new CoOpRelayPanel(player, gamePanels));
 	else if(key == 'l' || key == 'm')
 		GetUI().Push(new LoadPanel(player, gamePanels));
 	else if(key == 'n' && !player.IsLoaded())

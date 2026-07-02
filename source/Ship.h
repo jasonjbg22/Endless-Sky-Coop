@@ -171,6 +171,8 @@ public:
 	// Get the name of this particular ship.
 	const std::string &GivenName() const;
 	void SetGivenName(const std::string &name);
+	const std::string &CoOpProxyId() const noexcept;
+	void SetCoOpProxyId(std::string id);
 
 	// Set / Get the name of this model of ship.
 	void SetTrueModelName(const std::string &model);
@@ -202,6 +204,7 @@ public:
 
 	void SetPosition(Point position);
 	void SetVelocity(Point velocity);
+	void SetFacing(Angle facing);
 	// When creating a new ship, you must set the following:
 	void Place(Point position = Point(), Point velocity = Point(), Angle angle = Angle(), bool isDeparting = true);
 	void SetSystem(const System *system);
@@ -343,6 +346,13 @@ public:
 	bool IsDestroyed() const;
 	// Recharge and repair this ship (e.g. because it has landed).
 	void Recharge(int rechargeType = Port::RechargeType::All, bool hireCrew = true);
+	// Apply externally authoritative state to a temporary co-op proxy ship.
+	void SetCoOpProxyState(double shields, double hull, double fuel, double energy, double heat, bool disabled);
+	// Keep a co-op proxy ship visible, targetable, and collidable while snapshots are driving it.
+	void RefreshCoOpProxyFlightState();
+	// Apply a friend-PvP hit that was validated by the co-op relay.
+	int ApplyCoOpCombatDamage(double shieldDamage, double hullDamage, double fuelDamage,
+		double energyDamage, double heatDamage, bool disabled, bool destroyed);
 	// Check if this ship is able to give the given ship enough fuel to jump.
 	bool CanRefuel(const Ship &other) const;
 	// Check if this ship can transfer sufficient energy to the other ship.
@@ -630,6 +640,7 @@ private:
 	// Characteristics of this particular ship:
 	EsUuid uuid;
 	std::string givenName;
+	std::string coOpProxyId;
 	bool canBeCarried = false;
 
 	int forget = 0;

@@ -24,6 +24,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "CoreStartData.h"
 #include "DamageDealt.h"
 #include "DamageProfile.h"
+#include "DataNode.h"
 #include "Effect.h"
 #include "FighterHitHelper.h"
 #include "shader/FillShader.h"
@@ -37,6 +38,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Government.h"
 #include "Hazard.h"
 #include "Interface.h"
+#include "shader/LineShader.h"
 #include "Logger.h"
 #include "MapPanel.h"
 #include "image/Mask.h"
@@ -44,8 +46,10 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "Minable.h"
 #include "MinableDamageDealt.h"
 #include "Mission.h"
+#include "multiplayer/CoOpRelayController.h"
 #include "NPC.h"
 #include "shader/OutlineShader.h"
+#include "Outfit.h"
 #include "Person.h"
 #include "Planet.h"
 #include "PlanetLabel.h"
@@ -73,16 +77,159 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "UI.h"
 #include "Visual.h"
 #include "Weather.h"
+#include "Weapon.h"
 #include "Wormhole.h"
 #include "text/WrappedText.h"
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <set>
 #include <string>
+#include <vector>
 
 using namespace std;
 
 namespace {
+	constexpr int COOP_MAX_SHARED_NPCS_PER_SYSTEM = 24;
+	constexpr int COOP_MAX_LOCAL_NPCS_PER_SYSTEM = 48;
+	constexpr int COOP_NPC_PROXY_INTERPOLATION_DELAY = 2;
+	constexpr int COOP_NPC_PROXY_MAX_EXTRAPOLATION = 8;
+	constexpr int COOP_MAX_WEAPON_FIRE_EVENTS_PER_STEP = 12;
+	constexpr int COOP_MAX_REMOTE_WEAPON_FIRES_PER_STEP = 36;
+	constexpr size_t COOP_REMOTE_WEAPON_FIRE_QUEUE_LIMIT = 144;
+	constexpr double COOP_WEAPON_TRACER_MAX_RANGE = 220.;
+	constexpr double COOP_REMOTE_WEAPON_MUZZLE_TRACER_MAX_RANGE = 72.;
+	constexpr int COOP_REMOTE_WEAPON_TRACER_LIFETIME = 5;
+	constexpr int COOP_REMOTE_WEAPON_MUZZLE_TRACER_LIFETIME = 3;
+	constexpr size_t COOP_REMOTE_WEAPON_TRACER_LIMIT = 96;
+	constexpr size_t COOP_REMOTE_PROJECTILE_LIMIT = 256;
+	constexpr size_t COOP_REMOTE_VISUAL_LIMIT = 512;
+	constexpr double COOP_PVP_MIN_SHIELD_DAMAGE = .005;
+
+
+
+	Angle InterpolateAngle(const Angle &from, const Angle &to, double fraction)
+	{
+		double delta = to.Degrees() - from.Degrees();
+		while(delta > 180.)
+			delta -= 360.;
+		while(delta < -180.)
+			delta += 360.;
+		return Angle(from.Degrees() + delta * fraction);
+	}
+
+
+
+	const Personality &CoOpProxyPersonality()
+	{
+		static const Personality personality = [] {
+			Personality result;
+			DataNode node;
+			node.AddToken("personality");
+			node.AddToken("pacifist");
+			node.AddToken("staying");
+			node.AddToken("uninterested");
+			node.AddToken("mute");
+			result.Load(node);
+			return result;
+		}();
+		return personality;
+	}
+
+
+
+	const Personality &CoOpAdoptedNPCPersonality()
+	{
+		// Once this client becomes the system authority, former proxies must resume normal AI.
+		static const Personality personality;
+		return personality;
+	}
+
+
+
+	string CoOpWeaponOutfitName(const Ship &ship, const Weapon &weapon)
+	{
+		for(const Hardpoint &hardpoint : ship.Weapons())
+			if(hardpoint.GetWeapon() == &weapon && hardpoint.GetOutfit())
+				return hardpoint.GetOutfit()->TrueName();
+		return {};
+	}
+
+
+
+	void PublishCoOpMissionEvent(CoOpRelayController &controller, uint64_t &sequence, const string &npcId,
+		const string &system, CoOpRelay::MissionEventType type, const string &detail)
+	{
+		const string playerId = controller.PlayerId();
+		if(playerId.empty() || npcId.empty() || system.empty())
+			return;
+
+		CoOpRelay::SharedMissionEvent event;
+		event.sequence = sequence++;
+		event.missionId = "shared-npc";
+		event.instanceId = npcId;
+		event.playerId = playerId;
+		event.type = type;
+		event.system = system;
+		event.npcId = npcId;
+		event.detail = detail;
+		if(controller.PublishSharedMissionEvent(event))
+			Messages::Add({"Co-op mission: " + detail, GameData::MessageCategories().Get("normal")});
+	}
+
+
+
+	vector<string> CoOpRewardRemoteParticipants(const CoOpRelayController &controller, const string &system)
+	{
+		vector<string> result;
+		if(system.empty())
+			return result;
+
+		for(const CoOpRelay::RemotePresence &presence : controller.Remotes().All())
+			if(presence.IsInSystem(system))
+			{
+				const string &playerId = presence.latest.playerId;
+				if(!playerId.empty())
+					result.push_back(playerId);
+			}
+		return result;
+	}
+
+
+
+	void PublishAndApplyCoOpCreditReward(CoOpRelayController &controller, PlayerInfo &player, uint64_t &sequence,
+		string actionId, int64_t credits, const string &system, string detail)
+	{
+		const string playerId = controller.PlayerId();
+		if(playerId.empty() || actionId.empty() || credits <= 0)
+			return;
+
+		vector<string> remoteParticipants = CoOpRewardRemoteParticipants(controller, system);
+		const int participants = 1 + static_cast<int>(remoteParticipants.size());
+		const int64_t perPlayerCredits = max<int64_t>(1, credits / participants);
+
+		for(const string &targetPlayerId : remoteParticipants)
+		{
+			CoOpRelay::SharedResourceEvent event;
+			event.sequence = sequence++;
+			event.actionId = actionId + ":" + targetPlayerId;
+			event.playerId = playerId;
+			event.targetPlayerId = targetPlayerId;
+			event.type = CoOpRelay::ResourceActionType::CREDIT_REWARD;
+			event.status = CoOpRelay::ResourceActionStatus::APPLIED;
+			event.resource = "credits";
+			event.amount = static_cast<double>(perPlayerCredits);
+			event.detail = detail;
+			controller.PublishSharedResourceEvent(event);
+		}
+
+		player.Accounts().AddCredits(perPlayerCredits);
+		Messages::Add({detail, GameData::MessageCategories().Get("normal")});
+	}
+
+
+
 	int RadarType(const Ship &ship, int step)
 	{
 		if(ship.GetPersonality().IsTarget() && !ship.IsDestroyed())
@@ -520,6 +667,13 @@ void Engine::Step(bool isActive)
 				SpriteLoadManager::LoadDeferred(asyncQueue, object.GetSprite());
 
 	// The calculation thread was paused by MainPanel before calling this function, so it is safe to access things.
+	SyncCoOpPlayerProxies();
+	SyncCoOpNPCProxies();
+	ApplyCoOpWeaponFires();
+	ApplyCoOpCombatHits();
+	ApplyCoOpNPCDamageReports();
+	ApplyCoOpNPCBoardingReports();
+	PublishCoOpNPCSnapshots();
 	const shared_ptr<Ship> flagship = player.FlagshipPtr();
 	const StellarObject *object = player.GetStellarObject();
 	if(object)
@@ -908,12 +1062,51 @@ void Engine::Step(bool isActive)
 			targetUnit = target->Facing().Unit();
 		targetSwizzle = target->GetSwizzle();
 		info.SetSprite("target sprite", target->GetSprite(), targetUnit, target->GetFrame(step), targetSwizzle);
-		info.SetString("target name", target->GivenName());
-		info.SetString("target type", target->DisplayModelName());
-		if(!target->GetGovernment())
-			info.SetString("target government", "No Government");
-		else
-			info.SetString("target government", target->GetGovernment()->DisplayName());
+		string targetName = target->GivenName();
+		string targetModelName = target->DisplayModelName();
+		string targetGovernment = target->GetGovernment() ? target->GetGovernment()->DisplayName() : "No Government";
+		const string &coOpProxyId = target->CoOpProxyId();
+		if(!coOpProxyId.empty())
+		{
+			CoOpRelayController &controller = CoOpRelayController::Get();
+			if(coOpPlayerProxies.contains(coOpProxyId))
+			{
+				if(const CoOpRelay::RemotePresence *presence = controller.Remotes().Get(coOpProxyId))
+				{
+					const CoOpRelay::PlayerSnapshot &snapshot = presence->latest;
+					if(!snapshot.name.empty())
+						targetName = snapshot.name;
+					if(!snapshot.shipModel.empty())
+					{
+						if(const Ship *model = GameData::Ships().Find(snapshot.shipModel))
+							targetModelName = model->DisplayModelName();
+						else
+							targetModelName = snapshot.shipModel;
+					}
+				}
+				targetGovernment = "Player";
+			}
+			else if(const CoOpRelay::SharedNPCSnapshot *snapshot = controller.SharedNPCs().Get(coOpProxyId))
+			{
+				if(!snapshot->shipModel.empty())
+				{
+					if(const Ship *model = GameData::Ships().Find(snapshot->shipModel))
+						targetModelName = model->DisplayModelName();
+					else
+						targetModelName = snapshot->shipModel;
+				}
+				if(!snapshot->government.empty())
+				{
+					if(const Government *government = GameData::Governments().Get(snapshot->government))
+						targetGovernment = government->DisplayName();
+					else
+						targetGovernment = snapshot->government;
+				}
+			}
+		}
+		info.SetString("target name", targetName);
+		info.SetString("target type", targetModelName);
+		info.SetString("target government", targetGovernment);
 		info.SetString("mission target", target->GetPersonality().IsTarget() ? "(mission target)" : "");
 
 		// Only update the "active" state shown for the target if it is
@@ -1191,6 +1384,30 @@ bool Engine::IsPaused() const
 
 
 
+bool Engine::ShouldRunCoOpBackgroundSimulation() const
+{
+	if(timePaused || player.IsDead() || !player.GetSystem())
+		return false;
+
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	if(!controller.IsConnected())
+		return false;
+
+	const string systemName = player.GetSystem()->TrueName();
+	const bool hasSharedNPCs = !controller.SharedNPCs().InSystem(systemName).empty()
+		|| !coOpNPCProxies.empty()
+		|| any_of(coOpNPCs.begin(), coOpNPCs.end(), [&systemName](const auto &it) {
+		return it.second.system == systemName;
+	});
+	if(!hasSharedNPCs)
+		return false;
+
+	const CoOpRelay::SystemAuthority *authority = controller.Authorities().Get(systemName);
+	return authority && authority->IsActive();
+}
+
+
+
 // Give a command on behalf of the player, used for integration tests.
 void Engine::GiveCommand(const Command &command)
 {
@@ -1236,6 +1453,18 @@ void Engine::Draw() const
 
 	draw[currentDrawBuffer].Draw();
 	batchDraw[currentDrawBuffer].Draw();
+
+	for(const CoOpRemoteWeaponTracer &tracer : coOpRemoteWeaponTracers)
+	{
+		if(tracer.lifetime <= 0 || tracer.initialLifetime <= 0)
+			continue;
+		const float alpha = static_cast<float>(tracer.lifetime) / tracer.initialLifetime;
+		const Point from = (tracer.from - camera.Center()) * zoom;
+		const Point to = (tracer.to - camera.Center()) * zoom;
+		const Color head = Color::Multiply(.65f * alpha, tracer.color);
+		const Color tail = Color::Multiply(.18f * alpha, tracer.color);
+		LineShader::DrawGradient(from, to, 1.4f, head, tail);
+	}
 
 	for(const auto &it : statuses)
 	{
@@ -1406,6 +1635,35 @@ void Engine::Draw() const
 
 	// Draw escort status.
 	escorts.Draw(hud->GetBox("escorts"));
+}
+
+
+
+Point Engine::ViewCenter() const
+{
+	return camera.Center();
+}
+
+
+
+double Engine::ViewportZoom() const
+{
+	return zoom;
+}
+
+
+
+bool Engine::HasCoOpPlayerProxy(const string &playerId) const
+{
+	auto it = coOpPlayerProxies.find(playerId);
+	if(it == coOpPlayerProxies.end() || !it->second || it->second->GetSystem() != player.GetSystem())
+		return false;
+
+	const Ship &proxy = *it->second;
+	const bool inShips = any_of(ships.begin(), ships.end(), [&proxy](const shared_ptr<Ship> &ship) {
+		return ship.get() == &proxy;
+	});
+	return inShips && proxy.Zoom() == 1. && !proxy.IsDestroyed() && proxy.IsTargetable() && proxy.GetSprite();
 }
 
 
@@ -1623,11 +1881,17 @@ void Engine::EnterSystem()
 	grudge.clear();
 
 	projectiles.clear();
+	coOpRemoteProjectiles.clear();
+	coOpRemoteWeaponTracers.clear();
+	coOpPendingWeaponFires.clear();
 	visuals.clear();
+	coOpRemoteVisuals.clear();
 	flotsam.clear();
 	// Cancel any projectiles, visuals, or flotsam created by ships this step.
 	newProjectiles.clear();
+	coOpNewRemoteProjectiles.clear();
 	newVisuals.clear();
+	coOpNewRemoteVisuals.clear();
 	newFlotsam.clear();
 
 	emptySoundsTimer.clear();
@@ -1684,7 +1948,11 @@ void Engine::CalculateStep()
 		HandleMouseClicks();
 	}
 	else
+	{
 		CalculateUnpaused(flagship, playerSystem);
+		SyncCoOpNPCProxies();
+	}
+	SyncCoOpPlayerProxies();
 
 	// Draw the objects. Start by figuring out where the view should be centered:
 	Camera newCamera = camera;
@@ -1771,8 +2039,12 @@ void Engine::CalculateStep()
 	// Draw the projectiles.
 	for(const Projectile &projectile : projectiles)
 		batchDraw[currentCalcBuffer].Add(projectile, projectile.Clip());
+	for(const Projectile &projectile : coOpRemoteProjectiles)
+		batchDraw[currentCalcBuffer].Add(projectile, projectile.Clip());
 	// Draw the visuals.
 	for(const Visual &visual : visuals)
+		batchDraw[currentCalcBuffer].AddVisual(visual);
+	for(const Visual &visual : coOpRemoteVisuals)
 		batchDraw[currentCalcBuffer].AddVisual(visual);
 }
 
@@ -1815,6 +2087,8 @@ void Engine::CalculateUnpaused(const Ship *flagship, const System *playerSystem)
 	for(const shared_ptr<Ship> &it : ships)
 	{
 		if(it == player.FlagshipPtr())
+			continue;
+		if(!it->CoOpProxyId().empty())
 			continue;
 		bool wasUntargetable = !it->IsTargetable();
 		MoveShip(it);
@@ -1867,6 +2141,7 @@ void Engine::CalculateUnpaused(const Ship *flagship, const System *playerSystem)
 		EnterSystem();
 	}
 	PrunePointers(ships);
+	SyncCoOpPlayerProxies();
 
 	// Move the asteroids. This must be done before collision detection. Minables
 	// may create visuals or flotsam.
@@ -1882,6 +2157,9 @@ void Engine::CalculateUnpaused(const Ship *flagship, const System *playerSystem)
 	for(Projectile &projectile : projectiles)
 		projectile.Move(newVisuals, newProjectiles);
 	Prune(projectiles);
+	for(Projectile &projectile : coOpRemoteProjectiles)
+		projectile.Move(coOpRemoteVisuals, coOpNewRemoteProjectiles);
+	Prune(coOpRemoteProjectiles);
 
 	// Step the weather.
 	for(Weather &weather : activeWeather)
@@ -1892,6 +2170,15 @@ void Engine::CalculateUnpaused(const Ship *flagship, const System *playerSystem)
 	for(Visual &visual : visuals)
 		visual.Move();
 	Prune(visuals);
+	for(Visual &visual : coOpRemoteVisuals)
+		visual.Move();
+	Prune(coOpRemoteVisuals);
+	for(CoOpRemoteWeaponTracer &tracer : coOpRemoteWeaponTracers)
+		--tracer.lifetime;
+	coOpRemoteWeaponTracers.erase(remove_if(coOpRemoteWeaponTracers.begin(), coOpRemoteWeaponTracers.end(),
+		[](const CoOpRemoteWeaponTracer &tracer) {
+			return tracer.lifetime <= 0;
+		}), coOpRemoteWeaponTracers.end());
 
 	// Perform various minor actions.
 	SpawnFleets();
@@ -1907,8 +2194,17 @@ void Engine::CalculateUnpaused(const Ship *flagship, const System *playerSystem)
 	// them to the lists until now.
 	ships.splice(ships.end(), newShips);
 	Append(projectiles, newProjectiles);
+	Append(coOpRemoteProjectiles, coOpNewRemoteProjectiles);
 	flotsam.splice(flotsam.end(), newFlotsam);
 	Append(visuals, newVisuals);
+	Append(coOpRemoteVisuals, coOpNewRemoteVisuals);
+	if(coOpRemoteProjectiles.size() > COOP_REMOTE_PROJECTILE_LIMIT)
+		coOpRemoteProjectiles.erase(coOpRemoteProjectiles.begin(),
+			coOpRemoteProjectiles.begin() + (coOpRemoteProjectiles.size() - COOP_REMOTE_PROJECTILE_LIMIT));
+	if(coOpRemoteVisuals.size() > COOP_REMOTE_VISUAL_LIMIT)
+		coOpRemoteVisuals.erase(coOpRemoteVisuals.begin(),
+			coOpRemoteVisuals.begin() + (coOpRemoteVisuals.size() - COOP_REMOTE_VISUAL_LIMIT));
+	SyncCoOpPlayerProxies();
 
 	// Decrement the count of how long it's been since a ship last asked for help.
 	if(grudgeTime)
@@ -2031,7 +2327,10 @@ void Engine::MoveShip(const shared_ptr<Ship> &ship)
 	ship->Launch(newShips, newVisuals);
 
 	// Fire weapons.
+	const size_t firstCoOpWeaponFireProjectile = newProjectiles.size();
 	ship->Fire(newProjectiles, newVisuals, ship.get() == flagship ? &emptySoundsTimer : nullptr);
+	if(ship.get() == flagship)
+		ReportCoOpWeaponFire(*ship, firstCoOpWeaponFireProjectile);
 
 	// Anti-missile and tractor beam systems are fired separately from normal weaponry.
 	// Track which ships have at least one such system ready to fire.
@@ -2039,6 +2338,1208 @@ void Engine::MoveShip(const shared_ptr<Ship> &ship)
 		hasAntiMissile.push_back(ship.get());
 	if(ship->HasTractorBeam())
 		hasTractorBeam.push_back(ship.get());
+}
+
+
+
+void Engine::SyncCoOpPlayerProxies()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const System *currentSystem = player.GetSystem();
+	const string localPlayerId = controller.PlayerId();
+
+	auto removeProxy = [this](const shared_ptr<Ship> &proxy) {
+		if(!proxy)
+			return;
+		proxy->SetCoOpProxyId({});
+		proxy->SetIsSpecial(false);
+		ships.remove_if([&proxy](const shared_ptr<Ship> &ship) {
+			return ship == proxy;
+		});
+		newShips.remove_if([&proxy](const shared_ptr<Ship> &ship) {
+			return ship == proxy;
+		});
+	};
+
+	if(!controller.IsConnected() || !currentSystem || localPlayerId.empty())
+	{
+		for(const auto &it : coOpPlayerProxies)
+			removeProxy(it.second);
+		coOpPlayerProxies.clear();
+		coOpPlayerProxyMotion.clear();
+		return;
+	}
+
+	const string systemName = currentSystem->TrueName();
+	set<string> keep;
+	for(const CoOpRelay::RemotePresence &presence : controller.Remotes().All())
+	{
+		const CoOpRelay::PlayerSnapshot &snapshot = presence.latest;
+		if(snapshot.playerId.empty() || snapshot.playerId == localPlayerId || snapshot.system != systemName
+				|| !snapshot.landedPlanet.empty() || !snapshot.simulationActive)
+			continue;
+
+		const Ship *model = snapshot.shipModel.empty() ? nullptr : GameData::Ships().Find(snapshot.shipModel);
+		if(!model)
+			model = player.Flagship();
+		if(!model)
+			model = GameData::Ships().Find("Sparrow");
+		if(!model)
+			continue;
+		if(model->GetSprite())
+			SpriteLoadManager::LoadDeferred(asyncQueue, model->GetSprite());
+
+		keep.insert(snapshot.playerId);
+		shared_ptr<Ship> &proxy = coOpPlayerProxies[snapshot.playerId];
+		CoOpNPCProxyMotion &motion = coOpPlayerProxyMotion[snapshot.playerId];
+		if(snapshot.sequence > motion.latestSequence)
+		{
+			if(motion.hasLatest)
+			{
+				motion.previousSequence = motion.latestSequence;
+				motion.previousPosition = motion.latestPosition;
+				motion.previousVelocity = motion.latestVelocity;
+				motion.previousFacing = motion.latestFacing;
+				motion.previousStep = motion.latestStep;
+				motion.hasPrevious = true;
+			}
+			motion.latestSequence = snapshot.sequence;
+			motion.latestPosition = snapshot.position;
+			motion.latestVelocity = snapshot.velocity;
+			motion.latestFacing = snapshot.facing;
+			motion.latestStep = step;
+			motion.hasLatest = true;
+			if(!motion.hasPrevious)
+			{
+				motion.previousSequence = motion.latestSequence;
+				motion.previousPosition = motion.latestPosition;
+				motion.previousVelocity = motion.latestVelocity;
+				motion.previousFacing = motion.latestFacing;
+				motion.previousStep = max(0, step - 1);
+				motion.hasPrevious = true;
+			}
+		}
+
+		Point targetPosition = motion.hasLatest ? motion.latestPosition : snapshot.position;
+		Point targetVelocity = motion.hasLatest ? motion.latestVelocity : snapshot.velocity;
+		Angle targetFacing = motion.hasLatest ? motion.latestFacing : snapshot.facing;
+		if(motion.hasPrevious && motion.latestStep > motion.previousStep)
+		{
+			const int renderStep = step - COOP_NPC_PROXY_INTERPOLATION_DELAY;
+			const double fraction = clamp(
+				static_cast<double>(renderStep - motion.previousStep) / (motion.latestStep - motion.previousStep),
+				0., 1.);
+			targetPosition = motion.previousPosition.Lerp(motion.latestPosition, fraction);
+			targetVelocity = motion.previousVelocity.Lerp(motion.latestVelocity, fraction);
+			targetFacing = InterpolateAngle(motion.previousFacing, motion.latestFacing, fraction);
+			const int extrapolateSteps = min(max(0, renderStep - motion.latestStep),
+				COOP_NPC_PROXY_MAX_EXTRAPOLATION);
+			targetPosition += targetVelocity * extrapolateSteps;
+		}
+
+		const string proxyModelName = model->TrueModelName();
+		const bool needsFreshProxy = !proxy || proxy->TrueModelName() != proxyModelName
+			|| proxy->ShouldBeRemoved() || proxy->IsDestroyed() || !proxy->IsTargetable();
+		if(needsFreshProxy)
+		{
+			if(proxy)
+				removeProxy(proxy);
+			proxy = make_shared<Ship>(*model);
+			proxy->SetGivenName(snapshot.name.empty() ? snapshot.playerId : snapshot.name);
+			proxy->SetSystem(currentSystem);
+			proxy->SetPlanet(nullptr);
+			proxy->Place(targetPosition, targetVelocity, targetFacing, false);
+			proxy->RefreshCoOpProxyFlightState();
+			ships.push_back(proxy);
+		}
+		else
+			proxy->SetPosition(targetPosition);
+
+		if(find(ships.begin(), ships.end(), proxy) == ships.end())
+			ships.push_back(proxy);
+
+		proxy->SetGovernment(GameData::Governments().Get("Player"));
+		proxy->SetCoOpProxyId(snapshot.playerId);
+		proxy->SetSystem(currentSystem);
+		proxy->SetPlanet(nullptr);
+		proxy->SetIsYours(false);
+		proxy->SetVelocity(targetVelocity);
+		proxy->SetFacing(targetFacing);
+		proxy->SetPersonality(CoOpProxyPersonality());
+		proxy->SetIsSpecial(false);
+		proxy->ClearTargetsAndOrders();
+		proxy->SetCoOpProxyState(snapshot.shields, snapshot.hull, snapshot.fuel, snapshot.energy, snapshot.heat,
+			snapshot.hull <= 0.);
+		proxy->RefreshCoOpProxyFlightState();
+	}
+
+	for(auto it = coOpPlayerProxies.begin(); it != coOpPlayerProxies.end(); )
+	{
+		if(keep.contains(it->first))
+		{
+			++it;
+			continue;
+		}
+
+		removeProxy(it->second);
+		coOpPlayerProxyMotion.erase(it->first);
+		it = coOpPlayerProxies.erase(it);
+	}
+}
+
+
+
+void Engine::SyncCoOpNPCProxies()
+{
+	auto removeProxy = [this](const shared_ptr<Ship> &proxy) {
+		ships.remove_if([&proxy](const shared_ptr<Ship> &ship) {
+			return ship == proxy;
+		});
+		newShips.remove_if([&proxy](const shared_ptr<Ship> &ship) {
+			return ship == proxy;
+		});
+	};
+
+	auto clearProxies = [&] {
+		for(const auto &it : coOpNPCProxies)
+			removeProxy(it.second);
+		coOpNPCProxies.clear();
+		coOpNPCProxyMotion.clear();
+	};
+
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const System *currentSystem = player.GetSystem();
+	if(!controller.IsConnected() || !currentSystem)
+	{
+		clearProxies();
+		return;
+	}
+
+	const string systemName = currentSystem->TrueName();
+	if(controller.IsSystemAuthority(systemName))
+	{
+		const string ownerId = controller.PlayerId();
+		if(!ownerId.empty())
+			coOpNPCOwnerId = ownerId;
+		coOpNPCProxyMotion.clear();
+
+		auto applySnapshotState = [&](const shared_ptr<Ship> &ship, const CoOpRelay::SharedNPCSnapshot &snapshot) {
+			const Government *government = snapshot.government.empty() ? nullptr : GameData::Governments().Find(snapshot.government);
+			if(!government)
+				government = GameData::Governments().Get("Independent");
+			ship->SetGovernment(government);
+			ship->SetSystem(currentSystem);
+			ship->SetPlanet(nullptr);
+			ship->SetVelocity(snapshot.velocity);
+			ship->SetFacing(snapshot.facing);
+			ship->SetCoOpProxyState(snapshot.shields, snapshot.hull, snapshot.fuel, snapshot.energy, snapshot.heat,
+				snapshot.disabled);
+		};
+
+		for(auto it = coOpNPCProxies.begin(); it != coOpNPCProxies.end(); )
+		{
+			shared_ptr<Ship> proxy = it->second;
+			const CoOpRelay::SharedNPCSnapshot *snapshot = controller.SharedNPCs().Get(it->first);
+			if(!proxy || !snapshot || snapshot->system != systemName || snapshot->removed
+					|| snapshot->destroyed || snapshot->captured)
+			{
+				if(proxy)
+					removeProxy(proxy);
+				coOpNPCProxyMotion.erase(it->first);
+				it = coOpNPCProxies.erase(it);
+				continue;
+			}
+
+			CoOpNPCRecord &record = coOpNPCs[proxy.get()];
+			record.id = snapshot->npcId;
+			record.system = snapshot->system;
+			record.missionDisabled = snapshot->disabled;
+			record.missionDestroyed = snapshot->destroyed;
+			record.missionCaptured = snapshot->captured;
+			proxy->SetCoOpProxyId({});
+			proxy->SetIsSpecial(false);
+			proxy->SetIsYours(false);
+			proxy->SetPersonality(CoOpAdoptedNPCPersonality());
+			proxy->ClearTargetsAndOrders();
+			applySnapshotState(proxy, *snapshot);
+			PublishCoOpNPCSnapshot(*proxy, record);
+			coOpNPCProxyMotion.erase(it->first);
+			it = coOpNPCProxies.erase(it);
+		}
+
+		for(const CoOpRelay::SharedNPCSnapshot &snapshot : controller.SharedNPCs().InSystem(systemName))
+		{
+			if(snapshot.removed || snapshot.destroyed || snapshot.captured || snapshot.shipModel.empty())
+				continue;
+			if(any_of(coOpNPCs.begin(), coOpNPCs.end(), [&snapshot](const auto &it) {
+					return it.second.id == snapshot.npcId;
+				}))
+				continue;
+
+			const Ship *model = GameData::Ships().Find(snapshot.shipModel);
+			if(!model || !model->IsValid())
+				continue;
+
+			shared_ptr<Ship> live = make_shared<Ship>(*model);
+			live->SetGivenName(snapshot.npcId);
+			live->SetCoOpProxyId({});
+			live->SetIsSpecial(false);
+			live->SetIsYours(false);
+			live->SetPersonality(CoOpAdoptedNPCPersonality());
+			live->Place(snapshot.position, snapshot.velocity, snapshot.facing, false);
+			live->ClearTargetsAndOrders();
+			applySnapshotState(live, snapshot);
+			ships.push_back(live);
+
+			CoOpNPCRecord &record = coOpNPCs[live.get()];
+			record.id = snapshot.npcId;
+			record.system = snapshot.system;
+			record.missionDisabled = snapshot.disabled;
+			record.missionDestroyed = snapshot.destroyed;
+			record.missionCaptured = snapshot.captured;
+			PublishCoOpNPCSnapshot(*live, record);
+		}
+		return;
+	}
+
+	auto isProxyShip = [this](const shared_ptr<Ship> &ship) {
+		return any_of(coOpNPCProxies.begin(), coOpNPCProxies.end(),
+			[&ship](const auto &it) {
+				return it.second == ship;
+			});
+	};
+
+	auto isUnsharedLocalNPC = [&](const shared_ptr<Ship> &ship) {
+		if(!ship || ship->GetSystem() != currentSystem || ship->IsYours() || ship->IsSpecial()
+				|| ship->Zoom() != 1. || isProxyShip(ship))
+			return false;
+
+		const Government *government = ship->GetGovernment();
+		return government && !government->IsPlayer();
+	};
+
+	ships.remove_if(isUnsharedLocalNPC);
+	newShips.remove_if(isUnsharedLocalNPC);
+
+	set<string> keep;
+	for(const CoOpRelay::SharedNPCSnapshot &snapshot : controller.SharedNPCs().InSystem(systemName))
+	{
+		if(snapshot.removed || snapshot.destroyed || snapshot.captured || snapshot.shipModel.empty())
+			continue;
+
+		const Ship *model = GameData::Ships().Find(snapshot.shipModel);
+		if(!model || !model->IsValid())
+			continue;
+
+		keep.insert(snapshot.npcId);
+		shared_ptr<Ship> &proxy = coOpNPCProxies[snapshot.npcId];
+		if(proxy && proxy->TrueModelName() != snapshot.shipModel)
+		{
+			removeProxy(proxy);
+			proxy.reset();
+			coOpNPCProxyMotion.erase(snapshot.npcId);
+		}
+
+		CoOpNPCProxyMotion &motion = coOpNPCProxyMotion[snapshot.npcId];
+		if(!motion.hasLatest || snapshot.sequence > motion.latestSequence)
+		{
+			if(motion.hasLatest)
+			{
+				motion.previousSequence = motion.latestSequence;
+				motion.previousPosition = motion.latestPosition;
+				motion.previousVelocity = motion.latestVelocity;
+				motion.previousFacing = motion.latestFacing;
+				motion.previousStep = motion.latestStep;
+				motion.hasPrevious = true;
+			}
+			motion.latestSequence = snapshot.sequence;
+			motion.latestPosition = snapshot.position;
+			motion.latestVelocity = snapshot.velocity;
+			motion.latestFacing = snapshot.facing;
+			motion.latestStep = step;
+			motion.hasLatest = true;
+			if(!motion.hasPrevious)
+			{
+				motion.previousSequence = motion.latestSequence;
+				motion.previousPosition = motion.latestPosition;
+				motion.previousVelocity = motion.latestVelocity;
+				motion.previousFacing = motion.latestFacing;
+				motion.previousStep = max(0, step - 1);
+				motion.hasPrevious = true;
+			}
+		}
+
+		Point targetPosition = motion.latestPosition;
+		Point targetVelocity = motion.latestVelocity;
+		Angle targetFacing = motion.latestFacing;
+		if(motion.hasPrevious && motion.latestStep > motion.previousStep)
+		{
+			const int renderStep = step - COOP_NPC_PROXY_INTERPOLATION_DELAY;
+			const double fraction = clamp(
+				static_cast<double>(renderStep - motion.previousStep) / (motion.latestStep - motion.previousStep),
+				0., 1.);
+			targetPosition = motion.previousPosition.Lerp(motion.latestPosition, fraction);
+			targetVelocity = motion.previousVelocity.Lerp(motion.latestVelocity, fraction);
+			targetFacing = InterpolateAngle(motion.previousFacing, motion.latestFacing, fraction);
+			const int extrapolateSteps = min(max(0, renderStep - motion.latestStep),
+				COOP_NPC_PROXY_MAX_EXTRAPOLATION);
+			targetPosition += targetVelocity * extrapolateSteps;
+		}
+		if(!proxy)
+		{
+			proxy = make_shared<Ship>(*model);
+			proxy->SetGivenName(snapshot.npcId);
+			proxy->SetCoOpProxyId(snapshot.npcId);
+			proxy->SetIsSpecial();
+			proxy->SetIsYours(false);
+			proxy->SetPersonality(CoOpProxyPersonality());
+			proxy->SetSystem(currentSystem);
+			proxy->SetPlanet(nullptr);
+			proxy->Place(targetPosition, targetVelocity, targetFacing, false);
+			ships.push_back(proxy);
+		}
+		else
+		{
+			if(proxy->ShouldBeRemoved() || proxy->IsDestroyed())
+				proxy->Restore();
+			proxy->SetPosition(targetPosition);
+		}
+		if(find(ships.begin(), ships.end(), proxy) == ships.end())
+			ships.push_back(proxy);
+
+		const Government *government = snapshot.government.empty() ? nullptr : GameData::Governments().Find(snapshot.government);
+		if(!government)
+			government = GameData::Governments().Get("Independent");
+		proxy->SetGovernment(government);
+		proxy->SetCoOpProxyId(snapshot.npcId);
+		proxy->SetSystem(currentSystem);
+		proxy->SetPlanet(nullptr);
+		proxy->SetIsYours(false);
+		proxy->SetVelocity(targetVelocity);
+		proxy->SetFacing(targetFacing);
+		proxy->SetPersonality(CoOpProxyPersonality());
+		proxy->SetIsSpecial();
+		proxy->ClearTargetsAndOrders();
+		proxy->SetCoOpProxyState(snapshot.shields, snapshot.hull, snapshot.fuel, snapshot.energy, snapshot.heat,
+			snapshot.disabled);
+	}
+
+	for(auto it = coOpNPCProxies.begin(); it != coOpNPCProxies.end(); )
+	{
+		if(keep.contains(it->first))
+		{
+			++it;
+			continue;
+		}
+
+		removeProxy(it->second);
+		coOpNPCProxyMotion.erase(it->first);
+		it = coOpNPCProxies.erase(it);
+	}
+}
+
+
+
+void Engine::ApplyCoOpNPCDamageReports()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	for(const CoOpRelay::SharedNPCDamage &damage : controller.TakeNPCDamageReports())
+	{
+		auto recordIt = find_if(coOpNPCs.begin(), coOpNPCs.end(),
+			[&damage](const auto &it) {
+				return it.second.id == damage.npcId;
+			});
+		if(recordIt == coOpNPCs.end())
+			continue;
+
+		auto shipIt = find_if(ships.begin(), ships.end(),
+			[ship = recordIt->first](const shared_ptr<Ship> &candidate) {
+				return candidate.get() == ship;
+			});
+		if(shipIt == ships.end())
+			continue;
+
+		shared_ptr<Ship> ship = *shipIt;
+		const double shields = max(0., ship->Shields() - clamp(damage.shieldDamage, 0., 1.));
+		const double hull = max(0., ship->Hull() - clamp(damage.hullDamage, 0., 1.));
+		const double fuel = max(0., ship->Fuel() - clamp(damage.fuelDamage, 0., 1.));
+		const double energy = max(0., ship->Energy() - clamp(damage.energyDamage, 0., 1.));
+		const double heat = min(1., ship->Heat() + clamp(damage.heatDamage, 0., 1.));
+		ship->SetCoOpProxyState(shields, hull, fuel, energy, heat, damage.disabled);
+		if(damage.destroyed)
+			ship->Destroy();
+		PublishCoOpNPCSnapshot(*ship, recordIt->second);
+	}
+}
+
+
+
+void Engine::ApplyCoOpWeaponFires()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const System *currentSystem = player.GetSystem();
+	if(!currentSystem)
+	{
+		controller.TakeWeaponFires();
+		coOpPendingWeaponFires.clear();
+		return;
+	}
+
+	const string systemName = currentSystem->TrueName();
+	vector<CoOpRelay::SharedWeaponFire> fires;
+	fires.swap(coOpPendingWeaponFires);
+	for(const CoOpRelay::SharedWeaponFire &fire : controller.TakeWeaponFires())
+	{
+		if(fire.system != systemName)
+			continue;
+		fires.push_back(fire);
+	}
+
+	size_t processed = 0;
+	for(; processed < fires.size() && static_cast<int>(processed) < COOP_MAX_REMOTE_WEAPON_FIRES_PER_STEP; ++processed)
+	{
+		const CoOpRelay::SharedWeaponFire &fire = fires[processed];
+		Point from = fire.from;
+		Point velocity = fire.velocity;
+		Point ownVelocity = fire.hasShipVelocity ? fire.velocity - fire.shipVelocity : fire.velocity;
+		Point effectPosition = from;
+
+		auto proxyIt = coOpPlayerProxies.find(fire.playerId);
+		const CoOpRelay::RemotePresence *presence = controller.Remotes().Get(fire.playerId);
+		if(proxyIt != coOpPlayerProxies.end() && proxyIt->second && proxyIt->second->GetSystem() == currentSystem)
+		{
+			if(fire.hasShipVelocity)
+			{
+				const Point hardpointOffset = fire.from + .5 * fire.shipVelocity - fire.shipPosition;
+				const Point proxyVelocity = proxyIt->second->Velocity();
+				from = proxyIt->second->Position() + hardpointOffset - .5 * proxyVelocity;
+				effectPosition = proxyIt->second->Position() + hardpointOffset;
+				velocity = proxyVelocity + ownVelocity;
+			}
+			else
+			{
+				from = proxyIt->second->Position() + fire.from - fire.shipPosition;
+				effectPosition = from;
+			}
+		}
+		else if(presence)
+		{
+			const CoOpRelay::PlayerSnapshot snapshot = presence->Interpolate(.5);
+			if(fire.hasShipVelocity)
+			{
+				const Point hardpointOffset = fire.from + .5 * fire.shipVelocity - fire.shipPosition;
+				from = snapshot.position + hardpointOffset - .5 * snapshot.velocity;
+				effectPosition = snapshot.position + hardpointOffset;
+				velocity = snapshot.velocity + ownVelocity;
+			}
+			else
+			{
+				from = snapshot.position + fire.from - fire.shipPosition;
+				effectPosition = from;
+			}
+		}
+
+		const Point direction = Angle(fire.facing).Unit();
+		const double length = min(COOP_WEAPON_TRACER_MAX_RANGE, max(40., fire.from.Distance(fire.to)));
+		const Point to = from + direction * length;
+		AddCoOpRemoteWeaponVisual(fire.playerId, fire.system, fire.weapon, from,
+			effectPosition, to, velocity, ownVelocity, fire.facing, fire.targetPlayerId, fire.targetNPCId);
+	}
+
+	if(processed < fires.size())
+	{
+		coOpPendingWeaponFires.assign(fires.begin() + processed, fires.end());
+		if(coOpPendingWeaponFires.size() > COOP_REMOTE_WEAPON_FIRE_QUEUE_LIMIT)
+			coOpPendingWeaponFires.erase(coOpPendingWeaponFires.begin(),
+				coOpPendingWeaponFires.begin() + (coOpPendingWeaponFires.size() - COOP_REMOTE_WEAPON_FIRE_QUEUE_LIMIT));
+	}
+}
+
+
+
+void Engine::ApplyCoOpCombatHits()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const string localPlayerId = controller.PlayerId();
+	shared_ptr<Ship> flagship = player.FlagshipPtr();
+	if(localPlayerId.empty() || !flagship || !player.GetSystem())
+	{
+		controller.TakeCombatHits();
+		return;
+	}
+
+	for(const CoOpRelay::SharedCombatHit &hit : controller.TakeCombatHits())
+	{
+		if(hit.targetPlayerId != localPlayerId || hit.attackerId == localPlayerId || hit.system != player.GetSystem()->TrueName())
+			continue;
+		if(flagship->IsDestroyed() || flagship->IsHyperspacing())
+			continue;
+
+		double shieldDamage = hit.shieldDamage;
+		double hullDamage = hit.hullDamage;
+		double fuelDamage = hit.fuelDamage;
+		double energyDamage = hit.energyDamage;
+		double heatDamage = hit.heatDamage;
+		const double totalDamage = shieldDamage + hullDamage + fuelDamage + energyDamage + heatDamage;
+		if(totalDamage > 0. && totalDamage < COOP_PVP_MIN_SHIELD_DAMAGE)
+			shieldDamage = min(1., shieldDamage + COOP_PVP_MIN_SHIELD_DAMAGE - totalDamage);
+
+		int eventType = flagship->ApplyCoOpCombatDamage(shieldDamage, hullDamage, fuelDamage,
+			energyDamage, heatDamage, hit.disabled, hit.destroyed);
+		AddCoOpRemoteHitWeaponVisual(hit);
+		AddCoOpRemoteHitVisual(hit.weapon, hit.impactPosition, hit.hitVelocity, hit.facing);
+		if(eventType)
+			eventQueue.emplace_back(GameData::Governments().Get("Player"), flagship, eventType);
+	}
+}
+
+
+
+void Engine::ApplyCoOpNPCBoardingReports()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	for(const CoOpRelay::SharedNPCBoarding &boarding : controller.TakeNPCBoardingReports())
+	{
+		if(!boarding.IsRequest())
+		{
+			if(!boarding.detail.empty())
+				Messages::Add({boarding.detail, GameData::MessageCategories().Get("normal")});
+			continue;
+		}
+
+		auto recordIt = find_if(coOpNPCs.begin(), coOpNPCs.end(),
+			[&boarding](const auto &it) {
+				return it.second.id == boarding.npcId;
+			});
+		if(recordIt == coOpNPCs.end())
+			continue;
+
+		auto shipIt = find_if(ships.begin(), ships.end(),
+			[ship = recordIt->first](const shared_ptr<Ship> &candidate) {
+				return candidate.get() == ship;
+			});
+		if(shipIt == ships.end())
+			continue;
+
+		shared_ptr<Ship> ship = *shipIt;
+		CoOpRelay::SharedNPCBoarding result;
+		result.sequence = coOpNextNPCSequence++;
+		result.npcId = boarding.npcId;
+		result.playerId = boarding.playerId;
+		result.ownerId = controller.PlayerId();
+		result.system = recordIt->second.system;
+
+		if(!ship->IsDisabled() || ship->IsDestroyed())
+		{
+			result.action = CoOpRelay::BoardingAction::REJECTED;
+			result.detail = "Co-op boarding rejected: shared target is not disabled.";
+			controller.PublishSharedNPCBoarding(result);
+			continue;
+		}
+
+		if(!recordIt->second.missionBoarded)
+		{
+			recordIt->second.missionBoarded = true;
+			PublishCoOpMissionEvent(controller, coOpNextMissionEventSequence, recordIt->second.id,
+				recordIt->second.system, CoOpRelay::MissionEventType::NPC_BOARDED,
+				"Shared " + ship->TrueModelName() + " boarded.");
+		}
+
+		result.action = CoOpRelay::BoardingAction::CAPTURED;
+		result.detail = "Co-op capture confirmed.";
+		controller.PublishSharedNPCBoarding(result);
+
+		const int64_t reward = clamp<int64_t>(ship->Cost() / 100, 1000, 50000);
+		const int participants = 1 + static_cast<int>(CoOpRewardRemoteParticipants(controller, recordIt->second.system).size());
+		PublishAndApplyCoOpCreditReward(controller, player, coOpNextResourceEventSequence,
+			"capture-reward:" + recordIt->second.id + ":" + to_string(step), reward, recordIt->second.system,
+			"Co-op reward: " + Format::CreditString(max<int64_t>(1, reward / participants))
+				+ " each for capturing shared " + ship->TrueModelName() + ".");
+		PublishCoOpNPCSnapshot(*ship, recordIt->second, true, true);
+		if(!recordIt->second.missionCaptured)
+		{
+			recordIt->second.missionCaptured = true;
+			PublishCoOpMissionEvent(controller, coOpNextMissionEventSequence, recordIt->second.id,
+				recordIt->second.system, CoOpRelay::MissionEventType::NPC_CAPTURED,
+				"Shared " + ship->TrueModelName() + " captured.");
+		}
+
+		ships.erase(shipIt);
+		coOpNPCs.erase(recordIt);
+	}
+}
+
+
+
+void Engine::PublishCoOpNPCSnapshots()
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const System *currentSystem = player.GetSystem();
+	const string ownerId = controller.PlayerId();
+
+	auto publishRemoval = [&](const CoOpNPCRecord &record) {
+		if(ownerId.empty() || record.id.empty() || record.system.empty())
+			return;
+
+		CoOpRelay::SharedNPCSnapshot snapshot;
+		snapshot.sequence = coOpNextNPCSequence++;
+		snapshot.npcId = record.id;
+		snapshot.ownerId = ownerId;
+		snapshot.system = record.system;
+		snapshot.removed = true;
+		controller.PublishSharedNPC(snapshot);
+	};
+
+	auto erasePublished = [&](bool notify, const auto &shouldErase) {
+		for(auto it = coOpNPCs.begin(); it != coOpNPCs.end(); )
+		{
+			if(!shouldErase(it->second))
+			{
+				++it;
+				continue;
+			}
+
+			if(notify)
+				publishRemoval(it->second);
+			it = coOpNPCs.erase(it);
+		}
+		if(coOpNPCs.empty())
+			coOpLastNPCPublishStep = -1;
+	};
+
+	auto clearPublished = [&](bool notify) {
+		erasePublished(notify, [](const CoOpNPCRecord &) { return true; });
+		coOpNPCOwnerId.clear();
+	};
+
+	if(!controller.IsConnected() || !currentSystem || ownerId.empty())
+	{
+		clearPublished(false);
+		return;
+	}
+
+	if(coOpNPCOwnerId != ownerId)
+	{
+		coOpNPCs.clear();
+		coOpNPCOwnerId = ownerId;
+		coOpNextNPCId = 1;
+	}
+
+	const string systemName = currentSystem->TrueName();
+	const bool isCurrentSystemAuthority = controller.IsSystemAuthority(systemName);
+	if(!isCurrentSystemAuthority)
+	{
+		erasePublished(true, [&](const CoOpNPCRecord &record) {
+			return record.system == systemName || !controller.IsSystemAuthority(record.system);
+		});
+	}
+
+	if(coOpLastNPCPublishStep == step)
+		return;
+	coOpLastNPCPublishStep = step;
+	if(step % 6)
+		return;
+
+	class CoOpNPCPublishCandidate {
+	public:
+		shared_ptr<Ship> ship;
+		string system;
+		bool existing = false;
+		bool hostile = false;
+		double distance = 0.;
+	};
+
+	vector<CoOpNPCPublishCandidate> candidates;
+	const Ship *flagship = player.Flagship();
+	for(const shared_ptr<Ship> &ship : ships)
+	{
+		if(!ship || !ship->GetSystem() || ship->IsYours() || ship->IsSpecial() || !ship->CoOpProxyId().empty()
+				|| ship->Zoom() != 1. || ship->TrueModelName().empty())
+			continue;
+
+		const System *shipSystem = ship->GetSystem();
+		const string shipSystemName = shipSystem->TrueName();
+		if(!controller.IsSystemAuthority(shipSystemName))
+			continue;
+
+		// Only discover new shared NPCs in the current system; off-system publishing is for existing authority records.
+		auto recordIt = coOpNPCs.find(ship.get());
+		const bool isCurrentSystemShip = (shipSystem == currentSystem);
+		if(recordIt == coOpNPCs.end() && !isCurrentSystemShip)
+			continue;
+
+		const bool isProxy = any_of(coOpNPCProxies.begin(), coOpNPCProxies.end(),
+			[&ship](const auto &it) {
+				return it.second == ship;
+			});
+		if(isProxy)
+			continue;
+
+		const Government *government = ship->GetGovernment();
+		if(!government || government->IsPlayer())
+			continue;
+
+		CoOpNPCPublishCandidate candidate;
+		candidate.ship = ship;
+		candidate.system = shipSystemName;
+		candidate.existing = (recordIt != coOpNPCs.end());
+		candidate.hostile = government->IsEnemy();
+		candidate.distance = flagship ? ship->Position().Distance(flagship->Position()) : ship->Position().Length();
+		candidates.push_back(std::move(candidate));
+	}
+
+	sort(candidates.begin(), candidates.end(),
+		[](const CoOpNPCPublishCandidate &left, const CoOpNPCPublishCandidate &right) {
+			if(left.existing != right.existing)
+				return left.existing;
+			if(left.hostile != right.hostile)
+				return left.hostile;
+			return left.distance < right.distance;
+		});
+
+	map<string, int> publishedBySystem;
+	set<const Ship *> seen;
+	for(const CoOpNPCPublishCandidate &candidate : candidates)
+	{
+		auto recordIt = coOpNPCs.find(candidate.ship.get());
+
+		int &published = publishedBySystem[candidate.system];
+		if(published >= COOP_MAX_SHARED_NPCS_PER_SYSTEM)
+			continue;
+		++published;
+
+		seen.insert(candidate.ship.get());
+		CoOpNPCRecord &record = (recordIt == coOpNPCs.end()) ? coOpNPCs[candidate.ship.get()] : recordIt->second;
+		if(record.id.empty())
+			record.id = ownerId + "-npc-" + to_string(coOpNextNPCId++);
+		record.system = candidate.system;
+		PublishCoOpNPCSnapshot(*candidate.ship, record);
+	}
+
+	for(auto it = coOpNPCs.begin(); it != coOpNPCs.end(); )
+	{
+		if(seen.contains(it->first))
+		{
+			++it;
+			continue;
+		}
+		if(it->second.system != systemName && controller.IsSystemAuthority(it->second.system))
+		{
+			++it;
+			continue;
+		}
+
+		publishRemoval(it->second);
+		it = coOpNPCs.erase(it);
+	}
+
+	auto isUnselectedLocalNPC = [&](const shared_ptr<Ship> &ship) {
+		if(!ship || ship->GetSystem() != currentSystem || ship->IsYours() || ship->IsSpecial()
+				|| !ship->CoOpProxyId().empty()
+				|| ship->Zoom() != 1. || seen.contains(ship.get()))
+			return false;
+
+		const Government *government = ship->GetGovernment();
+		return government && !government->IsPlayer();
+	};
+	ships.remove_if(isUnselectedLocalNPC);
+	newShips.remove_if(isUnselectedLocalNPC);
+}
+
+
+
+void Engine::PublishCoOpNPCSnapshot(const Ship &ship, CoOpNPCRecord &record, bool captured, bool removed)
+{
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const string ownerId = controller.PlayerId();
+	if(ownerId.empty() || record.id.empty() || record.system.empty())
+		return;
+
+	CoOpRelay::SharedNPCSnapshot snapshot;
+	snapshot.sequence = coOpNextNPCSequence++;
+	snapshot.npcId = record.id;
+	snapshot.ownerId = ownerId;
+	snapshot.system = record.system;
+	snapshot.position = ship.Position();
+	snapshot.velocity = ship.Velocity();
+	snapshot.facing = ship.Facing();
+	snapshot.shipModel = ship.TrueModelName();
+	if(ship.GetGovernment())
+		snapshot.government = ship.GetGovernment()->TrueName();
+	if(const shared_ptr<Ship> target = ship.GetTargetShip())
+	{
+		auto targetIt = coOpNPCs.find(target.get());
+		if(targetIt != coOpNPCs.end())
+			snapshot.targetId = targetIt->second.id;
+	}
+	snapshot.shields = ship.Shields();
+	snapshot.hull = ship.Hull();
+	snapshot.fuel = ship.Fuel();
+	snapshot.energy = ship.Energy();
+	snapshot.heat = ship.Heat();
+	snapshot.disabled = captured || ship.IsDisabled();
+	snapshot.destroyed = ship.IsDestroyed();
+	snapshot.captured = captured;
+	snapshot.removed = removed;
+	if(!controller.PublishSharedNPC(snapshot))
+		return;
+
+	if(snapshot.destroyed && !record.missionDestroyed)
+	{
+		record.missionDestroyed = true;
+		PublishCoOpMissionEvent(controller, coOpNextMissionEventSequence, record.id, record.system,
+			CoOpRelay::MissionEventType::NPC_DESTROYED,
+			"Shared " + ship.TrueModelName() + " destroyed.");
+	}
+	else if(snapshot.disabled && !record.missionDisabled)
+	{
+		record.missionDisabled = true;
+		PublishCoOpMissionEvent(controller, coOpNextMissionEventSequence, record.id, record.system,
+			CoOpRelay::MissionEventType::NPC_DISABLED,
+			"Shared " + ship.TrueModelName() + " disabled.");
+	}
+}
+
+
+
+void Engine::ReportCoOpNPCDamage(const shared_ptr<Ship> &ship, double shields, double hull, double fuel,
+	double energy, double heat)
+{
+	if(!ship)
+		return;
+
+	auto proxyIt = find_if(coOpNPCProxies.begin(), coOpNPCProxies.end(),
+		[&ship](const auto &it) {
+			return it.second == ship;
+		});
+	if(proxyIt == coOpNPCProxies.end())
+		return;
+
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const string reporterId = controller.PlayerId();
+	if(reporterId.empty())
+		return;
+
+	CoOpRelay::SharedNPCDamage damage;
+	damage.sequence = coOpNextNPCDamageSequence++;
+	damage.npcId = proxyIt->first;
+	if(const CoOpRelay::SharedNPCSnapshot *snapshot = controller.SharedNPCs().Get(proxyIt->first))
+	{
+		damage.ownerId = snapshot->ownerId;
+		damage.system = snapshot->system;
+	}
+	damage.reporterId = reporterId;
+	damage.shieldDamage = max(0., shields - ship->Shields());
+	damage.hullDamage = max(0., hull - ship->Hull());
+	damage.fuelDamage = max(0., fuel - ship->Fuel());
+	damage.energyDamage = max(0., energy - ship->Energy());
+	damage.heatDamage = max(0., ship->Heat() - heat);
+	damage.disabled = ship->IsDisabled();
+	damage.destroyed = ship->IsDestroyed();
+	if(damage.IsValid())
+		controller.PublishSharedNPCDamage(damage);
+}
+
+
+
+void Engine::ReportCoOpCombatHit(const shared_ptr<Ship> &ship, double shields, double hull, double fuel,
+	double energy, double heat, const string &weaponName, const Point &impactPosition, const Point &hitVelocity,
+	double facing)
+{
+	if(!ship)
+		return;
+
+	auto proxyIt = find_if(coOpPlayerProxies.begin(), coOpPlayerProxies.end(),
+		[&ship](const auto &it) {
+			return it.second == ship;
+		});
+	if(proxyIt == coOpPlayerProxies.end())
+		return;
+
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const string attackerId = controller.PlayerId();
+	if(attackerId.empty() || !player.GetSystem())
+		return;
+
+	CoOpRelay::SharedCombatHit hit;
+	hit.sequence = coOpNextCombatHitSequence++;
+	hit.attackerId = attackerId;
+	hit.targetPlayerId = proxyIt->first;
+	hit.system = player.GetSystem()->TrueName();
+	if(const Ship *flagship = player.Flagship())
+	{
+		hit.attackerModel = flagship->TrueModelName();
+		if(flagship->GetGovernment())
+			hit.attackerGovernment = flagship->GetGovernment()->TrueName();
+	}
+	hit.shieldDamage = max(0., shields - ship->Shields());
+	hit.hullDamage = max(0., hull - ship->Hull());
+	hit.fuelDamage = max(0., fuel - ship->Fuel());
+	hit.energyDamage = max(0., energy - ship->Energy());
+	hit.heatDamage = max(0., ship->Heat() - heat);
+	const double totalDamage = hit.shieldDamage + hit.hullDamage + hit.fuelDamage + hit.energyDamage + hit.heatDamage;
+	if(totalDamage < COOP_PVP_MIN_SHIELD_DAMAGE)
+		hit.shieldDamage = min(1., hit.shieldDamage + COOP_PVP_MIN_SHIELD_DAMAGE - totalDamage);
+	hit.disabled = ship->IsDisabled();
+	hit.destroyed = ship->IsDestroyed();
+	hit.weapon = weaponName;
+	hit.impactPosition = impactPosition;
+	hit.hitVelocity = hitVelocity;
+	hit.facing = facing;
+	hit.detail = "PvP hit";
+	if(hit.IsValid())
+	{
+		const bool published = controller.PublishSharedCombatHit(hit);
+		if(!published)
+			Messages::Add({"PvP hit failed to send.", GameData::MessageCategories().Get("normal")});
+	}
+}
+
+
+
+void Engine::AddCoOpRemoteHitVisual(const string &weaponName, const Point &impactPosition, const Point &hitVelocity,
+	double facingDegrees)
+{
+	if(weaponName.empty())
+		return;
+
+	const Outfit *outfit = GameData::Outfits().Find(weaponName);
+	if(!outfit || !outfit->GetWeapon())
+		return;
+
+	const Weapon *weapon = outfit->GetWeapon().get();
+	const Point position = impactPosition != Point() ? impactPosition
+		: (player.Flagship() ? player.Flagship()->Position() : Point());
+	const Point velocity = hitVelocity;
+	const Angle facing(facingDegrees);
+	for(const auto &[effect, count] : weapon->HitEffects())
+		for(int i = 0; i < count; ++i)
+			coOpNewRemoteVisuals.emplace_back(*effect, position, velocity, facing, velocity);
+
+	if(coOpNewRemoteVisuals.size() > COOP_REMOTE_VISUAL_LIMIT)
+		coOpNewRemoteVisuals.erase(coOpNewRemoteVisuals.begin(),
+			coOpNewRemoteVisuals.begin() + (coOpNewRemoteVisuals.size() - COOP_REMOTE_VISUAL_LIMIT));
+}
+
+
+
+void Engine::ReportCoOpWeaponFire(const Ship &ship, size_t firstProjectile)
+{
+	if(ship.IsDestroyed() || player.Flagship() != &ship || !player.GetSystem())
+		return;
+
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	const string playerId = controller.PlayerId();
+	if(!controller.IsConnected() || playerId.empty())
+		return;
+
+	const string systemName = player.GetSystem()->TrueName();
+	size_t published = 0;
+	for(size_t i = firstProjectile; i < newProjectiles.size() && published < COOP_MAX_WEAPON_FIRE_EVENTS_PER_STEP; ++i)
+	{
+		const Projectile &projectile = newProjectiles[i];
+		if(projectile.GetGovernment() != ship.GetGovernment())
+			continue;
+
+		const Weapon &weapon = projectile.GetWeapon();
+		const string weaponName = CoOpWeaponOutfitName(ship, weapon);
+		if(weaponName.empty())
+			continue;
+
+		const double length = clamp(weapon.Range(), 120., COOP_WEAPON_TRACER_MAX_RANGE);
+		CoOpRelay::SharedWeaponFire fire;
+		fire.sequence = coOpNextWeaponFireSequence++;
+		fire.playerId = playerId;
+		fire.system = systemName;
+		fire.from = projectile.Position();
+		fire.to = fire.from + projectile.Facing().Unit() * length;
+		fire.velocity = projectile.Velocity();
+		fire.facing = projectile.Facing().Degrees();
+		fire.shipPosition = ship.Position();
+		fire.shipVelocity = ship.Velocity();
+		fire.hasShipVelocity = true;
+		fire.weapon = weaponName;
+		if(const Entity *target = projectile.Target())
+		{
+			for(const auto &[remoteId, proxy] : coOpPlayerProxies)
+				if(proxy && proxy.get() == target)
+				{
+					fire.targetPlayerId = remoteId;
+					break;
+				}
+			if(fire.targetPlayerId.empty())
+			{
+				for(const auto &[npcId, proxy] : coOpNPCProxies)
+					if(proxy && proxy.get() == target)
+					{
+						fire.targetNPCId = npcId;
+						break;
+					}
+				if(fire.targetNPCId.empty())
+					for(const auto &[npcShip, record] : coOpNPCs)
+						if(npcShip == target)
+						{
+							fire.targetNPCId = record.id;
+							break;
+						}
+			}
+		}
+		controller.PublishSharedWeaponFire(fire);
+		++published;
+	}
+}
+
+
+
+bool Engine::AddCoOpRemoteWeaponVisual(const string &playerId, const string &system, const string &weaponName,
+	const Point &projectilePosition, const Point &effectPosition, const Point &to, const Point &velocity,
+	const Point &ownVelocity, double facingDegrees, const string &targetPlayerId, const string &targetNPCId)
+{
+	if(playerId.empty() || system.empty() || weaponName.empty() || projectilePosition == to || !player.GetSystem()
+			|| system != player.GetSystem()->TrueName())
+		return false;
+
+	const Outfit *outfit = GameData::Outfits().Find(weaponName);
+	if(!outfit || !outfit->GetWeapon())
+		return false;
+
+	const Weapon *weapon = outfit->GetWeapon().get();
+	if(weapon->WeaponSprite().GetSprite())
+		SpriteLoadManager::LoadDeferred(asyncQueue, weapon->WeaponSprite().GetSprite());
+
+	shared_ptr<Ship> target;
+	if(!targetPlayerId.empty())
+	{
+		const string localPlayerId = CoOpRelayController::Get().PlayerId();
+		if(targetPlayerId == localPlayerId)
+			target = player.FlagshipPtr();
+		else
+		{
+			auto targetIt = coOpPlayerProxies.find(targetPlayerId);
+			if(targetIt != coOpPlayerProxies.end())
+				target = targetIt->second;
+		}
+	}
+	if(!target && !targetNPCId.empty())
+	{
+		auto proxyTargetIt = coOpNPCProxies.find(targetNPCId);
+		if(proxyTargetIt != coOpNPCProxies.end())
+			target = proxyTargetIt->second;
+		else
+		{
+			auto liveTargetIt = find_if(coOpNPCs.begin(), coOpNPCs.end(),
+				[&targetNPCId](const auto &it) {
+					return it.second.id == targetNPCId;
+				});
+			if(liveTargetIt != coOpNPCs.end())
+			{
+				auto shipIt = find_if(ships.begin(), ships.end(),
+					[ship = liveTargetIt->first](const shared_ptr<Ship> &candidate) {
+						return candidate.get() == ship;
+					});
+				if(shipIt != ships.end())
+					target = *shipIt;
+			}
+		}
+	}
+
+	shared_ptr<Ship> proxyShip;
+	auto proxyIt = coOpPlayerProxies.find(playerId);
+	if(proxyIt != coOpPlayerProxies.end() && proxyIt->second && proxyIt->second->GetSystem() == player.GetSystem())
+		proxyShip = proxyIt->second;
+
+	const Government *government = proxyShip ? proxyShip->GetGovernment() : GameData::Governments().Get("Player");
+	const Angle facing(facingDegrees);
+	coOpNewRemoteProjectiles.emplace_back(projectilePosition, velocity, ownVelocity, facing, weapon,
+		government, target);
+	for(const auto &[effect, count] : weapon->FireEffects())
+		for(int i = 0; i < count; ++i)
+			coOpNewRemoteVisuals.emplace_back(*effect, effectPosition, velocity - ownVelocity, facing);
+	if(const Sound *sound = weapon->WeaponSound())
+		Audio::Play(sound, effectPosition, SoundCategory::WEAPON);
+	if(weapon->Lifetime() <= 2)
+		AddCoOpRemoteWeaponTracer(effectPosition, to, Color(.7f, .55f, .16f, .7f),
+			COOP_REMOTE_WEAPON_TRACER_LIFETIME);
+	else
+	{
+		const double visualLength = min(COOP_REMOTE_WEAPON_MUZZLE_TRACER_MAX_RANGE,
+			max(24., ownVelocity.Length() * .5));
+		AddCoOpRemoteWeaponTracer(effectPosition, effectPosition + facing.Unit() * visualLength,
+			Color(.55f, .45f, .18f, .45f), COOP_REMOTE_WEAPON_MUZZLE_TRACER_LIFETIME);
+	}
+
+	if(coOpNewRemoteProjectiles.size() > COOP_REMOTE_PROJECTILE_LIMIT)
+		coOpNewRemoteProjectiles.erase(coOpNewRemoteProjectiles.begin(),
+			coOpNewRemoteProjectiles.begin() + (coOpNewRemoteProjectiles.size() - COOP_REMOTE_PROJECTILE_LIMIT));
+	if(coOpNewRemoteVisuals.size() > COOP_REMOTE_VISUAL_LIMIT)
+		coOpNewRemoteVisuals.erase(coOpNewRemoteVisuals.begin(),
+			coOpNewRemoteVisuals.begin() + (coOpNewRemoteVisuals.size() - COOP_REMOTE_VISUAL_LIMIT));
+	return true;
+}
+
+
+
+void Engine::AddCoOpRemoteWeaponTracer(const Point &from, const Point &to, const Color &color, int lifetime)
+{
+	if(from == to || lifetime <= 0)
+		return;
+
+	const Point unit = (to - from).Unit();
+	const double length = min(COOP_WEAPON_TRACER_MAX_RANGE, max(36., from.Distance(to)));
+	CoOpRemoteWeaponTracer tracer;
+	tracer.from = from;
+	tracer.to = from + unit * length;
+	tracer.color = color;
+	tracer.lifetime = lifetime;
+	tracer.initialLifetime = lifetime;
+	coOpRemoteWeaponTracers.push_back(tracer);
+	if(coOpRemoteWeaponTracers.size() > COOP_REMOTE_WEAPON_TRACER_LIMIT)
+		coOpRemoteWeaponTracers.erase(coOpRemoteWeaponTracers.begin(),
+			coOpRemoteWeaponTracers.begin() + (coOpRemoteWeaponTracers.size() - COOP_REMOTE_WEAPON_TRACER_LIMIT));
+}
+
+
+
+void Engine::AddCoOpRemoteHitWeaponVisual(const CoOpRelay::SharedCombatHit &hit)
+{
+	if(hit.weapon.empty() || hit.attackerId.empty() || hit.targetPlayerId.empty() || !player.GetSystem()
+			|| hit.system != player.GetSystem()->TrueName())
+		return;
+
+	Point from;
+	Point velocity = hit.hitVelocity;
+	Point ownVelocity = hit.hitVelocity;
+	auto proxyIt = coOpPlayerProxies.find(hit.attackerId);
+	if(proxyIt != coOpPlayerProxies.end() && proxyIt->second && proxyIt->second->GetSystem() == player.GetSystem())
+	{
+		from = proxyIt->second->Position();
+		ownVelocity = hit.hitVelocity - proxyIt->second->Velocity();
+	}
+	else if(const CoOpRelay::RemotePresence *presence = CoOpRelayController::Get().Remotes().Get(hit.attackerId))
+	{
+		const CoOpRelay::PlayerSnapshot snapshot = presence->Interpolate(.5);
+		if(snapshot.system != hit.system || snapshot.IsLanded())
+			return;
+		from = snapshot.position;
+		ownVelocity = hit.hitVelocity - snapshot.velocity;
+	}
+	else
+		return;
+
+	Point to = hit.impactPosition;
+	if(to == Point())
+	{
+		const shared_ptr<Ship> flagship = player.FlagshipPtr();
+		if(!flagship)
+			return;
+		to = flagship->Position();
+	}
+
+	double facing = hit.facing;
+	if(from != to)
+		facing = Angle(to - from).Degrees();
+	AddCoOpRemoteWeaponVisual(hit.attackerId, hit.system, hit.weapon, from, from, to, velocity, ownVelocity,
+		facing, hit.targetPlayerId, "");
 }
 
 
@@ -2066,6 +3567,19 @@ void Engine::SpawnFleets()
 	{
 		Place(player.ActiveInFlightMission()->NPCs(), player.FlagshipPtr());
 		player.ClearActiveInFlightMission();
+	}
+	CoOpRelayController &controller = CoOpRelayController::Get();
+	if(controller.ShouldSuppressLocalNPCSpawns(player))
+		return;
+	if(controller.IsConnected() && player.GetSystem() && controller.IsSystemAuthority(player.GetSystem()->TrueName()))
+	{
+		int localNPCs = 0;
+		for(const shared_ptr<Ship> &ship : ships)
+			if(ship && ship->GetSystem() == player.GetSystem() && !ship->IsYours() && !ship->IsSpecial()
+					&& ship->Zoom() == 1.)
+				++localNPCs;
+		if(localNPCs >= COOP_MAX_LOCAL_NPCS_PER_SYSTEM)
+			return;
 	}
 
 	// Non-mission NPCs spawn at random intervals in neighboring systems,
@@ -2264,6 +3778,12 @@ void Engine::HandleKeyboardInputs()
 			&& !activeCommands.Has(Command::LAND | Command::JUMP | Command::BOARD | Command::STOP))
 		activeCommands |= Command::AUTOSTEER;
 
+	if(keyDown.Has(Command::NEAREST_COOP_PLAYER))
+	{
+		activeCommands.Clear(Command::NEAREST_COOP_PLAYER);
+		TargetNearestCoOpPlayer();
+	}
+
 	if(keyDown.Has(Command::PAUSE))
 	{
 		timePaused = !timePaused;
@@ -2273,6 +3793,50 @@ void Engine::HandleKeyboardInputs()
 			Audio::Resume();
 		UI::PlaySound(UI::UISound::NORMAL);
 	}
+}
+
+
+
+bool Engine::IsSelectableCoOpPlayerProxy(const Ship &ship) const
+{
+	if(ship.CoOpProxyId().empty() || ship.IsSpecial() || ship.IsYours() || ship.GetSystem() != player.GetSystem())
+		return false;
+
+	auto it = coOpPlayerProxies.find(ship.CoOpProxyId());
+	return it != coOpPlayerProxies.end() && it->second.get() == &ship && ship.Zoom() == 1.
+		&& !ship.IsDestroyed();
+}
+
+
+
+bool Engine::TargetNearestCoOpPlayer()
+{
+	shared_ptr<Ship> flagship = player.FlagshipPtr();
+	if(!flagship || !player.GetSystem())
+		return false;
+
+	double closest = numeric_limits<double>::infinity();
+	shared_ptr<Ship> nearest;
+	for(const auto &it : coOpPlayerProxies)
+	{
+		const shared_ptr<Ship> &ship = it.second;
+		if(!ship || !IsSelectableCoOpPlayerProxy(*ship))
+			continue;
+
+		const double distance = ship->Position().Distance(flagship->Position());
+		if(distance < closest)
+		{
+			closest = distance;
+			nearest = ship;
+		}
+	}
+
+	if(!nearest)
+		return false;
+
+	flagship->SetTargetShip(nearest);
+	UI::PlaySound(UI::UISound::TARGET);
+	return true;
 }
 
 
@@ -2336,7 +3900,8 @@ void Engine::HandleMouseClicks()
 	double clickRange = 50.;
 	shared_ptr<Ship> clickTarget;
 	for(shared_ptr<Ship> &ship : ships)
-		if(ship->GetSystem() == playerSystem && &*ship != flagship && ship->IsTargetable())
+		if(ship->GetSystem() == playerSystem && &*ship != flagship
+				&& (ship->IsTargetable() || IsSelectableCoOpPlayerProxy(*ship)))
 		{
 			Point position = ship->Position() - camera.Center();
 			const Mask &mask = ship->GetMask(step);
@@ -2539,6 +4104,10 @@ void Engine::DoCollisions(Projectile &projectile)
 		// If this projectile has a blast radius, find all ships and minables within its
 		// radius. Otherwise, only one is damaged.
 		double blastRadius = weapon.BlastRadius();
+		string coOpWeaponName;
+		if(gov && gov->IsPlayer())
+			if(const Ship *flagship = player.Flagship())
+				coOpWeaponName = CoOpWeaponOutfitName(*flagship, weapon);
 		if(blastRadius)
 		{
 			// Even friendly ships can be hit by the blast, unless it is a
@@ -2557,8 +4126,19 @@ void Engine::DoCollisions(Projectile &projectile)
 					continue;
 
 				// Only directly targeted ships get provoked by blast weapons.
+				const double shields = ship->Shields();
+				const double hull = ship->Hull();
+				const double fuel = ship->Fuel();
+				const double energy = ship->Energy();
+				const double heat = ship->Heat();
 				int eventType = ship->TakeDamage(visuals, damage.CalculateDamage(*ship, ship == hit),
 					targeted ? gov : nullptr);
+				if(gov && gov->IsPlayer())
+				{
+					ReportCoOpCombatHit(ship->shared_from_this(), shields, hull, fuel, energy, heat,
+						coOpWeaponName, hitPos, projectile.Velocity(), projectile.Facing().Degrees());
+					ReportCoOpNPCDamage(ship->shared_from_this(), shields, hull, fuel, energy, heat);
+				}
 				if(eventType)
 					eventQueue.emplace_back(gov, ship->shared_from_this(), eventType);
 			}
@@ -2574,7 +4154,19 @@ void Engine::DoCollisions(Projectile &projectile)
 		{
 			if(collisionType == CollisionType::SHIP)
 			{
+				const Point hitPos = projectile.Position() + range * projectile.Velocity();
+				const double shields = shipHit->Shields();
+				const double hull = shipHit->Hull();
+				const double fuel = shipHit->Fuel();
+				const double energy = shipHit->Energy();
+				const double heat = shipHit->Heat();
 				int eventType = shipHit->TakeDamage(visuals, damage.CalculateDamage(*shipHit), gov);
+				if(gov && gov->IsPlayer())
+				{
+					ReportCoOpCombatHit(shipHit, shields, hull, fuel, energy, heat,
+						coOpWeaponName, hitPos, projectile.Velocity(), projectile.Facing().Degrees());
+					ReportCoOpNPCDamage(shipHit, shields, hull, fuel, energy, heat);
+				}
 				if(eventType)
 					eventQueue.emplace_back(gov, shipHit, eventType);
 			}

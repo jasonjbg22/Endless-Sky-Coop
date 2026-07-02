@@ -609,6 +609,7 @@ void PreferencesPanel::DrawControls()
 		Command::NONE,
 		Command::NONE,
 		Command::NEAREST,
+		Command::NEAREST_COOP_PLAYER,
 		Command::TARGET,
 		Command::HAIL,
 		Command::BOARD,

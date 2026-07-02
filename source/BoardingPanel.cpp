@@ -55,6 +55,14 @@ BoardingPanel::BoardingPanel(PlayerInfo &player, const shared_ptr<Ship> &victim)
 	// The escape key should close this panel rather than bringing up the main menu.
 	SetInterruptible(false);
 
+	if(victim && !victim->CoOpProxyId().empty())
+	{
+		messages.emplace_back("This is a shared co-op ship.");
+		messages.emplace_back("Use the co-op capture request instead.");
+		scroll.SetMaxValue(0.);
+		return;
+	}
+
 	// Figure out how much the victim's commodities are worth in the current
 	// system and add them to the list of plunder.
 	const System &system = *player.GetSystem();

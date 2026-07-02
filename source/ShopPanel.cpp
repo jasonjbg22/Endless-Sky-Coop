@@ -1231,12 +1231,12 @@ void ShopPanel::MainAutoScroll(const vector<Zone>::const_iterator &selected)
 	const int topY = selected->Center().Y() - TILE_SIZE / 2;
 	const int offTop = topY + Screen::Bottom();
 	if(offTop < 0)
-		mainScroll += offTop;
+		mainScroll += static_cast<double>(offTop);
 	else
 	{
 		const int offBottom = topY + TILE_SIZE - Screen::Bottom();
 		if(offBottom > 0)
-			mainScroll += offBottom;
+			mainScroll += static_cast<double>(offBottom);
 	}
 }
 

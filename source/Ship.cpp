@@ -1214,6 +1214,20 @@ void Ship::SetGivenName(const string &name)
 
 
 
+const string &Ship::CoOpProxyId() const noexcept
+{
+	return coOpProxyId;
+}
+
+
+
+void Ship::SetCoOpProxyId(string id)
+{
+	coOpProxyId = std::move(id);
+}
+
+
+
 // Set / Get the name of this class of ships, e.g. "Marauder Raven."
 void Ship::SetTrueModelName(const string &model)
 {
@@ -1415,6 +1429,14 @@ void Ship::SetPosition(Point position)
 void Ship::SetVelocity(Point velocity)
 {
 	this->velocity = velocity;
+}
+
+
+
+void Ship::SetFacing(Angle facing)
+{
+	angle = Angle();
+	Turn(facing);
 }
 
 
@@ -2715,6 +2737,91 @@ void Ship::Recharge(int rechargeType, bool hireCrew)
 	shieldDelay = 0;
 	hullDelay = 0;
 	disabledRecoveryCounter = 0;
+}
+
+
+
+void Ship::SetCoOpProxyState(double shields, double hull, double fuel, double energy, double heat, bool disabled)
+{
+	this->shields = clamp(shields, 0., 1.) * MaxShields();
+	this->hull = clamp(hull, 0., 1.) * MaxHull();
+	this->fuel = clamp(fuel, 0., 1.) * attributes.Get("fuel capacity");
+	this->energy = clamp(energy, 0., 1.) * attributes.Get("energy capacity");
+	this->heat = clamp(heat, 0., 1.) * MaximumHeat();
+	if(disabled)
+		this->hull = min(this->hull, .5 * MinimumHull());
+
+	isDisabled = true;
+	isDisabled = disabled || IsDisabled();
+	isOverheated = this->heat > MaximumHeat();
+}
+
+
+
+void Ship::RefreshCoOpProxyFlightState()
+{
+	forget = 0;
+	isInSystem = true;
+	isInvisible = false;
+	cloak = 0.;
+	cloakDisruption = 0.;
+	hyperspaceCount = 0;
+	explosionRate = 0;
+	if(!IsDestroyed())
+		explosionCount = 0;
+	zoom = 1.;
+}
+
+
+
+int Ship::ApplyCoOpCombatDamage(double shieldDamage, double hullDamage, double fuelDamage,
+	double energyDamage, double heatDamage, bool disabled, bool destroyed)
+{
+	damageOverlayTimer = TOTAL_DAMAGE_FRAMES;
+
+	const bool wasDisabled = IsDisabled();
+	const bool wasDestroyed = IsDestroyed();
+
+	if(shieldDamage > 0.)
+	{
+		shields -= clamp(shieldDamage, 0., 1.) * MaxShields();
+		int disabledDelay = attributes.Get("depleted shield delay");
+		shieldDelay = max<int>(shieldDelay, (shields <= 0. && disabledDelay)
+			? disabledDelay : attributes.Get("shield delay"));
+	}
+	if(hullDamage > 0.)
+	{
+		hull -= clamp(hullDamage, 0., 1.) * MaxHull();
+		hullDelay = max(hullDelay, static_cast<int>(attributes.Get("repair delay")));
+	}
+	fuel -= clamp(fuelDamage, 0., 1.) * attributes.Get("fuel capacity");
+	energy -= clamp(energyDamage, 0., 1.) * attributes.Get("energy capacity");
+	heat += clamp(heatDamage, 0., 1.) * MaximumHeat();
+
+	shields = clamp(shields, 0., MaxShields());
+	hull = min(hull, MaxHull());
+	fuel = clamp(fuel, 0., attributes.Get("fuel capacity"));
+	energy = clamp(energy, 0., attributes.Get("energy capacity"));
+	heat = max(0., heat);
+
+	if(disabled)
+		hull = min(hull, .5 * MinimumHull());
+	if(destroyed)
+		hull = -1.;
+
+	isDisabled = true;
+	isDisabled = disabled || IsDisabled();
+	isOverheated = heat > MaximumHeat();
+
+	int type = 0;
+	if(!wasDisabled && isDisabled)
+	{
+		type |= ShipEvent::DISABLE;
+		hullDelay = max(hullDelay, static_cast<int>(attributes.Get("disabled repair delay")));
+	}
+	if(!wasDestroyed && IsDestroyed())
+		type |= ShipEvent::DESTROY;
+	return type;
 }
 
 

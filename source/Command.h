@@ -53,6 +53,7 @@ public:
 	static const Command FLEET_JUMP;
 	static const Command TARGET;
 	static const Command NEAREST;
+	static const Command NEAREST_COOP_PLAYER;
 	static const Command NEAREST_ASTEROID;
 	static const Command DEPLOY;
 	static const Command AFTERBURNER;

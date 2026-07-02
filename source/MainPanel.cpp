@@ -29,6 +29,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 #include "MessageLogPanel.h"
 #include "Messages.h"
 #include "Mission.h"
+#include "multiplayer/CoOpRelayController.h"
 #include "Planet.h"
 #include "PlanetPanel.h"
 #include "PlayerInfo.h"
@@ -131,7 +132,11 @@ void MainPanel::Step()
 	// and updating the isActive flag).
 	StepEvents(isActive);
 
-	if(isActive)
+	const bool coOpBackgroundSimulation = !isActive && engine.ShouldRunCoOpBackgroundSimulation();
+	CoOpRelayController::Get().SetSimulationActive((isActive || coOpBackgroundSimulation) && !engine.IsPaused());
+	CoOpRelayController::Get().Step(player);
+
+	if(isActive || coOpBackgroundSimulation)
 		engine.Go();
 	else
 		canDrag = false;
@@ -145,6 +150,7 @@ void MainPanel::Draw()
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	engine.Draw();
+	CoOpRelayController::Get().DrawFlightOverlay(player, engine);
 
 	if(isDragging)
 	{
@@ -645,6 +651,18 @@ void MainPanel::StepEvents(bool &isActive)
 				&& !event.Target()->IsDestroyed() && flagship && event.Actor().get() == flagship)
 		{
 			auto boardedShip = event.Target();
+			if((event.Type() == ShipEvent::BOARD) && !boardedShip->CoOpProxyId().empty())
+			{
+				CoOpRelayController &coOp = CoOpRelayController::Get();
+				if(coOp.PublishSharedNPCBoardingRequest(boardedShip->CoOpProxyId()))
+					Messages::Add({"Co-op capture requested.", GameData::MessageCategories().Get("normal")});
+				else
+					Messages::Add({"Co-op capture request failed.", GameData::MessageCategories().Get("normal")});
+				eventQueue.pop_front();
+				handledFront = false;
+				continue;
+			}
+
 			Mission *mission = player.BoardingMission(boardedShip);
 			if(mission && mission->HasSpace(*flagship))
 				mission->Do(Mission::OFFER, player, &GetUI(), boardedShip);

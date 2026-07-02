@@ -1,0 +1,231 @@
+# Copyright (c) 2026 by Endless Sky contributors
+#
+# Endless Sky is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later version.
+#
+# Endless Sky is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+
+test "Co-op Relay Wait Connected"
+	status partial
+	description "Helper function to wait for a launch-time co-op relay connection."
+	sequence
+		label "coop connecting"
+		branch "coop connecting"
+			"coop connected" == 0
+
+
+test "Co-op Relay Wait Peer"
+	status partial
+	description "Helper function to wait for a remote co-op player snapshot."
+	sequence
+		label "coop peer"
+		branch "coop peer"
+			"coop remote players" == 0
+
+
+test "Co-op Relay Wait Direct Peer"
+	status partial
+	description "Helper function to wait for a direct peer socket."
+	sequence
+		label "coop direct peer"
+		branch "coop direct peer"
+			"coop direct peers" == 0
+
+
+test "Co-op Relay Wait A Few Frames"
+	status partial
+	description "Helper function to let co-op snapshots flush through the relay."
+	sequence
+		apply
+			"test: steps to wait" = 10
+		label "coop frame wait"
+		input
+		apply
+			"test: steps to wait" = "test: steps to wait" - 1
+		branch "coop frame wait"
+			"test: steps to wait" > 0
+
+
+test "Co-op Relay Wait Render Frames"
+	status partial
+	description "Helper function to keep a rendered co-op smoke client alive for overlay observation."
+	sequence
+		apply
+			"test: steps to wait" = 40
+		label "coop render wait"
+		input
+		apply
+			"test: steps to wait" = "test: steps to wait" - 1
+		branch "coop render wait"
+			"test: steps to wait" > 0
+
+
+test "Co-op Relay Wait Control Freeze Window"
+	status partial
+	description "Helper function to stay in-flight past the old five-second control freeze window."
+	sequence
+		apply
+			"test: steps to wait" = 420
+		label "coop control freeze wait"
+		input
+			command forward
+		apply
+			"test: steps to wait" = "test: steps to wait" - 1
+		branch "coop control freeze wait"
+			"test: steps to wait" > 0
+
+
+test "Co-op Relay Smoke A"
+	status partial
+	description "Player A moves through normal gameplay while co-op emits relay presence."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		call "Co-op Relay Wait Direct Peer"
+		call "Depart"
+		assert
+			"flagship landed" == 0
+			"flagship disabled" == 0
+			"flagship shields" == 600
+			"flagship hull" == 1000
+		call "Co-op Relay Wait Control Freeze Window"
+		assert
+			"flagship landed" == 0
+			"flagship disabled" == 0
+			"flagship shields" == 600
+			"flagship hull" == 1000
+		call "Co-op Relay Wait A Few Frames"
+		navigate
+			travel "Alpha Centauri"
+		input
+			command jump
+		label "not alpha"
+		branch "not alpha"
+			not "flagship system: Alpha Centauri"
+		assert
+			"flagship fuel" < 300
+		call "Co-op Relay Wait A Few Frames"
+		navigate
+			travel Sol
+		input
+			command jump
+		label "not sol"
+		branch "not sol"
+			not "flagship system: Sol"
+		navigate
+			"travel destination" Earth
+		call "Land"
+		label "not refueled"
+		branch "not refueled"
+			"flagship fuel" < 300
+		call "Co-op Relay Wait A Few Frames"
+
+
+test "Co-op Relay Smoke B"
+	status partial
+	description "Player B observes Player A through relay presence without local gameplay mutation."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		call "Co-op Relay Wait Direct Peer"
+		label "remote flying sol"
+		branch "remote flying sol"
+			"coop remote players flying in system: Sol" == 0
+		assert
+			"flagship planet: Earth" == 1
+			"coop remote minimum fuel" == 1
+		label "remote alpha"
+		branch "remote alpha"
+			"coop remote players in system: Alpha Centauri" == 0
+		label "remote burned fuel"
+		branch "remote burned fuel"
+			"coop remote minimum fuel" >= 1
+		assert
+			"flagship planet: Earth" == 1
+			"coop recent event: jumped" > 0
+			"coop recent event: resources_changed" > 0
+		label "remote returned landed"
+		branch "remote returned landed"
+			"coop remote players landed on: Earth" == 0
+		label "remote refueled"
+		branch "remote refueled"
+			"coop remote minimum fuel" < 1
+		assert
+			"flagship planet: Earth" == 1
+			"coop remote minimum fuel" == 1
+			"coop recent event: landed" > 0
+
+
+test "Co-op Relay Password Smoke A"
+	status partial
+	description "Player A proves passworded executable relay rooms accept game clients and emit presence."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		call "Depart"
+		assert
+			"flagship landed" == 0
+		call "Co-op Relay Wait A Few Frames"
+
+
+test "Co-op Relay Password Smoke B"
+	status partial
+	description "Player B observes a remote player in a passworded executable relay room."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		label "password remote flying sol"
+		branch "password remote flying sol"
+			"coop remote players flying in system: Sol" == 0
+		assert
+			"flagship planet: Earth" == 1
+			"coop remote players" > 0
+
+
+test "Co-op Relay Render Smoke A"
+	status partial
+	description "Player A flies normally in-system long enough for Player B's rendered overlay to observe it."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		call "Depart"
+		assert
+			"flagship landed" == 0
+		call "Co-op Relay Wait Render Frames"
+
+
+test "Co-op Relay Render Smoke B"
+	status partial
+	description "Player B proves the co-op flight overlay draws a visible same-system remote contact."
+	sequence
+		inject "Three Earthly Barges Save"
+		call "Load First Savegame"
+		call "Co-op Relay Wait Connected"
+		call "Co-op Relay Wait Peer"
+		label "render remote flying sol"
+		branch "render remote flying sol"
+			"coop remote players flying in system: Sol" == 0
+		label "rendered contact"
+		branch "rendered contact"
+			"coop rendered flight contacts" == 0
+		assert
+			"flagship planet: Earth" == 1
+			"coop rendered same-system contacts" > 0
+			"coop rendered roster rows" > 0
