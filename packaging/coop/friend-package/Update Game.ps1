@@ -42,6 +42,20 @@ if (!$assetName) {
 Write-Host "Checking latest release from $owner/$repo..."
 $releaseUrl = "https://api.github.com/repos/$owner/$repo/releases/latest"
 $release = Invoke-RestMethod -Headers @{ "User-Agent" = "EndlessSkyCoopUpdater" } -Uri $releaseUrl
+$versionFile = Join-Path $root "version.txt"
+$localVersion = ""
+if (Test-Path $versionFile) {
+	Get-Content $versionFile | ForEach-Object {
+		if (!$localVersion -and $_ -match "^Version:\s*(.+)$") {
+			$localVersion = $Matches[1].Trim()
+		}
+	}
+}
+if ($localVersion -and $release.tag_name -and $localVersion -eq $release.tag_name) {
+	Write-Host "Already up to date: $localVersion"
+	exit 0
+}
+
 $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
 if (!$asset) {
 	$asset = $release.assets | Where-Object { $_.name -like "EndlessSky-Coop-Windows*.zip" } | Select-Object -First 1
@@ -73,7 +87,6 @@ try {
 		throw "File copy failed with robocopy exit code $LASTEXITCODE."
 	}
 
-	$versionFile = Join-Path $root "version.txt"
 	if (Test-Path $versionFile) {
 		Write-Host (Get-Content $versionFile -Raw)
 	}
