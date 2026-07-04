@@ -21,6 +21,49 @@ function Get-InstalledVersion($folder) {
 	return ""
 }
 
+function Write-LauncherScript($folder) {
+	$launcher = Join-Path $folder "Run Or Update Game.ps1"
+	@'
+$ErrorActionPreference = "Stop"
+$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$updater = Join-Path $root "Update Game.ps1"
+$game = Join-Path $root "Endless Sky.exe"
+
+if (!(Test-Path $updater)) {
+	throw "Updater not found: $updater"
+}
+if (!(Test-Path $game)) {
+	throw "Game not found: $game"
+}
+
+& powershell -NoProfile -ExecutionPolicy Bypass -File $updater
+if ($LASTEXITCODE -ne 0) {
+	Write-Host "Update failed or was cancelled. Launching current build anyway..."
+}
+
+Start-Process -FilePath $game -WorkingDirectory $root
+'@ | Set-Content -Encoding ASCII $launcher
+	return $launcher
+}
+
+function New-DesktopShortcut($folder) {
+	$launcher = Write-LauncherScript $folder
+	$desktop = [Environment]::GetFolderPath("Desktop")
+	$shortcutPath = Join-Path $desktop "Endless Sky Co-op - Update and Play.lnk"
+	$shortcutShell = New-Object -ComObject WScript.Shell
+	$shortcut = $shortcutShell.CreateShortcut($shortcutPath)
+	$shortcut.TargetPath = "powershell.exe"
+	$shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$launcher`""
+	$shortcut.WorkingDirectory = $folder
+	$icon = Join-Path $folder "Endless Sky.exe"
+	if (Test-Path $icon) {
+		$shortcut.IconLocation = $icon
+	}
+	$shortcut.Description = "Check for Endless Sky Co-op updates, then launch the game."
+	$shortcut.Save()
+	return $shortcutPath
+}
+
 $installRoot = [IO.Path]::GetFullPath($InstallDir)
 $localVersion = Get-InstalledVersion $installRoot
 
@@ -32,6 +75,10 @@ $release = Invoke-RestMethod `
 if ($localVersion -and $release.tag_name -and $localVersion -eq $release.tag_name) {
 	Write-Host "Already up to date: $localVersion"
 	Write-Host "Game folder: $installRoot"
+	if (Test-Path (Join-Path $installRoot "Endless Sky.exe")) {
+		$shortcut = New-DesktopShortcut $installRoot
+		Write-Host "Shortcut: $shortcut"
+	}
 	exit 0
 }
 
@@ -85,8 +132,10 @@ asset=$AssetName
 "@ | Set-Content -Encoding ASCII (Join-Path $installRoot "update-config.txt")
 
 	$installedVersion = Get-InstalledVersion $installRoot
+	$shortcut = New-DesktopShortcut $installRoot
 	Write-Host "Installed: $installedVersion"
 	Write-Host "Launch: $installRoot\Endless Sky.exe"
+	Write-Host "Shortcut: $shortcut"
 }
 finally {
 	Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
