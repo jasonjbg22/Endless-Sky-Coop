@@ -857,6 +857,10 @@ TEST_CASE( "Co-op relay endpoints parse user join addresses", "[CoOpRelay]" )
 	CHECK(endpoint.host == "relay.example.net");
 	CHECK(endpoint.port == 6000);
 
+	endpoint = CoOpRelay::ParseEndpoint("endless-sky-coop://relay.example.net:5050?room=Friends");
+	CHECK(endpoint.host == "relay.example.net");
+	CHECK(endpoint.port == 5050);
+
 	endpoint = CoOpRelay::ParseEndpoint("::1", 6000);
 	CHECK(endpoint.host == "::1");
 	CHECK(endpoint.port == 6000);

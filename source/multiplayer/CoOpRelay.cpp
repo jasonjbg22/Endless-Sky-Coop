@@ -4210,6 +4210,14 @@ CoOpRelay::RelayEndpoint CoOpRelay::ParseEndpoint(string address, uint16_t defau
 	endpoint.host = Trim(std::move(address));
 	endpoint.port = defaultPort;
 
+	const string invitePrefix = "endless-sky-coop://";
+	if(endpoint.host.rfind(invitePrefix, 0) == 0)
+		endpoint.host.erase(0, invitePrefix.size());
+
+	const size_t query = endpoint.host.find('?');
+	if(query != string::npos)
+		endpoint.host.erase(query);
+
 	size_t colon = endpoint.host.find(':');
 	if(colon != string::npos && endpoint.host.find(':', colon + 1) == string::npos)
 	{

@@ -19,6 +19,7 @@ this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 class Color;
@@ -50,8 +51,13 @@ private:
 	void PortRoom();
 	void SetRoomPort(const std::string &port);
 	void HostRoom();
+	void HostWanBridge();
 	void PlayHost();
 	void JoinLocal();
+	void FetchPublicIp();
+	void SetWanAddressPrompt();
+	void SetWanAddress(const std::string &address);
+	void CopyWanInvite();
 	void JoinAddressPrompt();
 	void JoinAddress(const std::string &address);
 	void JoinAddressWithPassword(const std::string &password);
@@ -69,15 +75,20 @@ private:
 	void EnterGame();
 
 private:
+	struct PublicIpLookupState;
+
 	PlayerInfo &player;
 	UI &gamePanels;
 	std::string roomName;
 	std::string roomPassword;
 	std::string directAddress = "host-public-ip:5050";
+	std::string wanAddress = "public-ip:5050";
 	uint16_t roomPort = 5050;
 	std::string pendingJoinHost;
 	uint16_t pendingJoinPort = 0;
 	int selectedDiscovery = -1;
 	std::string resourceTargetPlayerId;
+	std::string bridgeNotice;
+	std::shared_ptr<PublicIpLookupState> publicIpLookup;
 	bool diagnosticsVisible = false;
 };
